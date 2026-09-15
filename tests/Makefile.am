@@ -25,6 +25,12 @@ TESTS = prog_nfs4_delay prog_nfs4_errno
 check_PROGRAMS += prog_nfs4_object
 TESTS += prog_nfs4_object
 
+check_PROGRAMS += prog_nfs4_recovery
+TESTS += prog_nfs4_recovery
+
+check_PROGRAMS += prog_nfs4_slots
+TESTS += prog_nfs4_slots
+
 ld_timeout_SOURCES = ld_timeout.c
 ld_timeout_CFLAGS = $(AM_CFLAGS) -fPIC
 

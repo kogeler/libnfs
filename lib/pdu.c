@@ -398,7 +398,7 @@ static struct rpc_pdu *rpc_allocate_reply_pdu(struct rpc_context *rpc,
 	return pdu;
 }
 
-struct rpc_pdu *rpc_allocate_pdu2(struct rpc_context *rpc, int program, int version, int procedure, rpc_cb cb, void *private_data, zdrproc_t zdr_decode_fn, int zdr_decode_bufsize, size_t alloc_hint, int iovcnt_hint)
+struct rpc_pdu *rpc_allocate_pdu2_auth(struct rpc_context *rpc, int program, int version, int procedure, rpc_cb cb, void *private_data, zdrproc_t zdr_decode_fn, int zdr_decode_bufsize, size_t alloc_hint, int iovcnt_hint, const struct AUTH *auth)
 {
 	struct rpc_pdu *pdu;
 	int pdu_size;
@@ -498,10 +498,10 @@ struct rpc_pdu *rpc_allocate_pdu2(struct rpc_context *rpc, int program, int vers
 		 */
 		pdu->do_not_retry                = TRUE;
 	} else {
-		pdu->msg.body.cbody.cred    = rpc->auth->ah_cred;
+		pdu->msg.body.cbody.cred    = auth->ah_cred;
 	}
 
-	pdu->msg.body.cbody.verf    = rpc->auth->ah_verf;
+	pdu->msg.body.cbody.verf    = auth->ah_verf;
 
 #ifdef HAVE_TLS
 	/* Should not be already set */
@@ -615,6 +615,14 @@ struct rpc_pdu *rpc_allocate_pdu2(struct rpc_context *rpc, int program, int vers
         return NULL;
 }
 
+struct rpc_pdu *rpc_allocate_pdu2(struct rpc_context *rpc, int program, int version, int procedure, rpc_cb cb, void *private_data, zdrproc_t zdr_decode_fn, int zdr_decode_bufsize, size_t alloc_hint, int iovcnt_hint)
+{
+        return rpc_allocate_pdu2_auth(rpc, program, version, procedure, cb,
+                                     private_data, zdr_decode_fn,
+                                     zdr_decode_bufsize, alloc_hint, iovcnt_hint,
+                                     rpc->auth);
+}
+
 struct rpc_pdu *rpc_allocate_pdu(struct rpc_context *rpc, int program, int version, int procedure, rpc_cb cb, void *private_data, zdrproc_t zdr_decode_fn, int zdr_decode_bufsize)
 {
 	return rpc_allocate_pdu2(rpc, program, version, procedure, cb, private_data, zdr_decode_fn, zdr_decode_bufsize, 0, 0);
@@ -629,6 +637,9 @@ void rpc_free_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
 #ifdef HAVE_NFS4_2
+        if (rpc->nfs4_release_state) {
+                rpc->nfs4_release_state(rpc, pdu);
+        }
         /*
          * Hand back the NFSv4.2 session slot this COMPOUND was holding. This
          * is the one place every pdu passes through, whether it completed,
@@ -637,7 +648,7 @@ void rpc_free_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
          */
         if (pdu->nfs4_slot_held) {
                 pdu->nfs4_slot_held = 0;
-                nfs4_session_put_slot(rpc, pdu->nfs4_slot,
+                nfs4_session_put_slot(rpc, pdu,
                                       !pdu->nfs4_slot_sent);
         }
 #endif /* HAVE_NFS4_2 */
@@ -1260,6 +1271,10 @@ static int rpc_process_reply(struct rpc_context *rpc, ZDR *zdr)
 
         if (status != 0xffffffff) {
 #ifdef HAVE_NFS4_2
+                if (status == RPC_STATUS_SUCCESS &&
+                    nfs4_pdu_retry_recovery(rpc, pdu, data)) {
+                        return 0;
+                }
                 if (status == RPC_STATUS_SUCCESS && pdu->nfs4_delay_maxres &&
                     nfs4_pdu_retry_delay(rpc, pdu, data)) {
                         return 0;

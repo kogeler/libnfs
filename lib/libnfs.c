@@ -844,6 +844,10 @@ nfs_destroy_context(struct nfs_context *nfs)
         free(nfs->nfsi->cwd);
         free(nfs->nfsi->rootfh.val);
         free(nfs->nfsi->client_name);
+#ifdef HAVE_NFS4_2
+        free(nfs->nfsi->session_auth);
+        nfs42_destroy_open_files(nfs->nfsi);
+#endif
 	while (nfs->nfsi->dircache) {
 		struct nfsdir *nfsdir = nfs->nfsi->dircache;
 		LIBNFS_LIST_REMOVE(&nfs->nfsi->dircache, nfsdir);
@@ -1335,6 +1339,11 @@ free_nfs_cb_data(struct nfs_cb_data *data)
 void
 nfs_free_nfsfh(struct nfsfh *nfsfh)
 {
+#ifdef HAVE_NFS4_2
+        if (nfsfh->nfsi && !nfs42_release_open(nfsfh)) {
+                return;
+        }
+#endif
 	if (nfsfh->fh.val != NULL) {
 		free(nfsfh->fh.val);
 		nfsfh->fh.len = 0;

@@ -360,16 +360,18 @@ rpc_outqueue_present(struct rpc_context *rpc)
 static bool_t
 rpc_outqueue_head_waits_for_slot(struct rpc_context *rpc)
 {
-        bool_t waiting;
+        bool_t waiting, recovering;
 
 #ifdef HAVE_MULTITHREADING
         if (rpc->multithreading_enabled) {
                 nfs_mt_mutex_lock(&rpc->rpc_mutex);
         }
 #endif /* HAVE_MULTITHREADING */
-        waiting = rpc->outqueue.head != NULL &&
+        waiting = rpc->is_connected && rpc->outqueue.head != NULL &&
                 rpc->outqueue.head->nfs4_needs_slot &&
                 !rpc->outqueue.head->nfs4_slot_held;
+        recovering = rpc->is_connected && rpc->outqueue.head != NULL &&
+                nfs4_pdu_waits_for_recovery(rpc, rpc->outqueue.head);
 #ifdef HAVE_MULTITHREADING
         if (rpc->multithreading_enabled) {
                 nfs_mt_mutex_unlock(&rpc->rpc_mutex);
@@ -380,7 +382,7 @@ rpc_outqueue_head_waits_for_slot(struct rpc_context *rpc)
          * The slot table has its own lock, taken after rpc_mutex is dropped
          * so that the two are never held at once.
          */
-        return waiting && !nfs4_session_has_free_slot(rpc);
+        return recovering || (waiting && !nfs4_session_has_free_slot(rpc));
 }
 #endif /* HAVE_NFS4_2 */
 
@@ -435,6 +437,9 @@ rpc_write_to_socket(struct rpc_context *rpc)
         struct iovec *iov = fast_iov;
         int iovcnt = RPC_FAST_VECTORS;
         int ret = 0;
+#ifdef HAVE_NFS4_2
+        struct rpc_queue failed = {0};
+#endif
 
         assert(rpc->magic == RPC_CONTEXT_MAGIC);
         if (rpc->socket_disabled) {
@@ -489,6 +494,14 @@ rpc_write_to_socket(struct rpc_context *rpc)
                         assert(num_done < pdu->out.total_size);
 
 #ifdef HAVE_NFS4_2
+                        if (nfs4_pdu_waits_for_recovery(rpc, pdu)) {
+                                break;
+                        }
+                        if (pdu->nfs4_needs_slot && !pdu->nfs4_slot_held &&
+                            rpc->nfs4_prepare_state &&
+                            (pdu->nfs4_local_error = rpc->nfs4_prepare_state(rpc, pdu))) {
+                                break;
+                        }
                         /*
                          * An NFSv4.2 COMPOUND claims its session slot here,
                          * as it is about to be written, rather than when it
@@ -546,6 +559,12 @@ rpc_write_to_socket(struct rpc_context *rpc)
                  * asking for POLLOUT until a reply frees one.
                  */
                 if (niov == 0) {
+                        if (pdu && pdu->nfs4_local_error) {
+                                rpc_remove_pdu_from_queue(&rpc->outqueue, pdu);
+                                rpc->stats.outqueue_len--;
+                                rpc_enqueue(&failed, pdu);
+                                continue;
+                        }
                         ret = 0;
                         goto finished;
                 }
@@ -666,6 +685,18 @@ rpc_write_to_socket(struct rpc_context *rpc)
                 free(iov);
         }
 
+#ifdef HAVE_NFS4_2
+        /* As with received replies, callbacks run outside the queue mutex. */
+        while ((pdu = failed.head) != NULL) {
+                COMPOUND4res res = {0};
+                failed.head = pdu->next;
+                pdu->next = NULL;
+                res.status = pdu->nfs4_local_error;
+                pdu->cb(rpc, RPC_STATUS_SUCCESS, &res, pdu->private_data);
+                rpc_free_pdu(rpc, pdu);
+        }
+#endif
+
 	return ret;
 }
 
@@ -736,7 +767,11 @@ static void rpc_finished_pdu(struct rpc_context *rpc)
                 /*
                  * For zero-copy read, this is where we call the user callback.
                  */
-                rpc->pdu->cb(rpc, RPC_STATUS_SUCCESS, rpc->pdu->zdr_decode_buf, rpc->pdu->private_data);
+#ifdef HAVE_NFS4_2
+                if (!nfs4_pdu_retry_recovery(rpc, rpc->pdu,
+                                            rpc->pdu->zdr_decode_buf))
+#endif
+                        rpc->pdu->cb(rpc, RPC_STATUS_SUCCESS, rpc->pdu->zdr_decode_buf, rpc->pdu->private_data);
         }
         if (rpc->pdu && rpc->pdu->free_zdr) {
                 zdr_destroy(&rpc->pdu->zdr);
@@ -1538,12 +1573,7 @@ rpc_timeout_scan(struct rpc_context *rpc)
 }
 
 #ifdef HAVE_NFS4_2
-/*
- * The reply to a keepalive SEQUENCE. There is nothing to do with a good one.
- * A bad one means the session is no longer there, which is what happens when
- * the lease ran out before we got here, so drop it rather than keep sending
- * into it.
- */
+/* Only a definitive session error warrants replacing a session. */
 static void
 renew_session_cb(struct rpc_context *rpc, int status, void *command_data,
                  void *private_data _U_)
@@ -1557,9 +1587,12 @@ renew_session_cb(struct rpc_context *rpc, int status, void *command_data,
 		return;
 	}
 
-	RPC_LOG(rpc, 1, "NFSv4 session keepalive failed, the session is gone. "
-		"The context has to be remounted.");
-	nfs4_session_destroy(rpc);
+        if (status == RPC_STATUS_SUCCESS && res) {
+                nfs4_request_recovery(rpc, res->status);
+        }
+        RPC_LOG(rpc, 1, "NFSv4 session keepalive failed: %s",
+                status == RPC_STATUS_SUCCESS && res ?
+                nfsstat4_to_str(res->status) : "RPC failure");
 }
 
 /*
@@ -1578,7 +1611,8 @@ rpc_nfs4_maybe_renew_session(struct rpc_context *rpc)
 {
 	uint64_t now;
 
-	if (!rpc->is_connected || !rpc_nfs4_session_is_valid(rpc)) {
+	if (!rpc->is_connected || !rpc_nfs4_session_is_valid(rpc) ||
+            rpc->nfs4_recovery != NFS4_RECOVERY_IDLE) {
 		return;
 	}
 
@@ -1612,6 +1646,26 @@ rpc_service(struct rpc_context *rpc, int revents)
 
 #ifdef HAVE_NFS4_2
         nfs4_service_delayed(rpc);
+        if (rpc->nfs4_recovery == NFS4_RECOVERY_FAILED && rpc->auto_reconnect &&
+            rpc_current_time() >= rpc->nfs4_recovery_due) {
+                rpc->nfs4_recovery = NFS4_RECOVERY_RECONNECT;
+        }
+        if (rpc->nfs4_recovery == NFS4_RECOVERY_RECONNECT &&
+            rpc->is_connected && rpc_current_time() >= rpc->nfs4_recovery_due) {
+                return rpc_reconnect_requeue(rpc);
+        }
+        if (rpc->nfs4_recovery == NFS4_RECOVERY_PREPARE &&
+            rpc->is_connected && rpc->pdu == NULL
+#ifdef HAVE_TLS
+            && (!rpc->use_tls || rpc->tls_context.state == TLS_HANDSHAKE_COMPLETED)
+#endif
+            ) {
+                rpc->nfs4_recovery = NFS4_RECOVERY_CREATE;
+                nfs4_recovery_prepare(rpc);
+                if (rpc->nfs4_recover && rpc->nfs4_recovery == NFS4_RECOVERY_CREATE) {
+                        rpc->nfs4_recover(rpc, rpc->nfs4_recover_data);
+                }
+        }
 #endif
 
 	/*
@@ -2252,13 +2306,7 @@ reconnect_cb_tls(struct rpc_context *rpc, int status,
 #endif
 
 #ifdef HAVE_NFS4_2
-/*
- * Result of rebinding the session to a reconnected socket. A failure here
- * means the session is gone for good, usually because the lease ran out
- * while we were disconnected. Drop it so that the COMPOUNDs behind it fail
- * with a session error rather than being sent into a session the server no
- * longer has.
- */
+/* A transport failure alone says nothing about the lifetime of the session. */
 static void
 bind_conn_cb(struct rpc_context *rpc, int status, void *command_data,
              void *private_data _U_)
@@ -2272,9 +2320,14 @@ bind_conn_cb(struct rpc_context *rpc, int status, void *command_data,
 		return;
 	}
 
-	RPC_LOG(rpc, 1, "BIND_CONN_TO_SESSION failed, the NFSv4 session is "
-		"gone. The context has to be remounted.");
-	nfs4_session_destroy(rpc);
+        if (status == RPC_STATUS_SUCCESS && res) {
+                nfs4_request_recovery(rpc, res->status);
+        }
+        if (status != RPC_STATUS_CANCEL) {
+                RPC_LOG(rpc, 1, "BIND_CONN_TO_SESSION failed: %s",
+                        status == RPC_STATUS_SUCCESS && res ?
+                        nfsstat4_to_str(res->status) : "RPC failure");
+        }
 }
 
 /*
@@ -2291,6 +2344,16 @@ bind_conn_cb(struct rpc_context *rpc, int status, void *command_data,
 static void
 rpc_nfs4_rebind_session(struct rpc_context *rpc)
 {
+        if (rpc->nfs4_recovery == NFS4_RECOVERY_RECONNECT) {
+                rpc->nfs4_recovery = NFS4_RECOVERY_PREPARE;
+                return;
+        }
+	/* A CREATE_SESSION in flight is replayed on the new connection. */
+        if (rpc->nfs4_recovery == NFS4_RECOVERY_CREATE ||
+            rpc->nfs4_recovery == NFS4_RECOVERY_EXCHANGE ||
+            rpc->nfs4_recovery == NFS4_RECOVERY_PREPARE) {
+                return;
+        }
 	if (!rpc_nfs4_session_is_valid(rpc)) {
 		return;
 	}
@@ -2301,7 +2364,6 @@ rpc_nfs4_rebind_session(struct rpc_context *rpc)
 
 	RPC_LOG(rpc, 1, "failed to rebind the NFSv4 session to the new "
 		"connection. %s", rpc_get_error(rpc));
-	nfs4_session_destroy(rpc);
 	rpc_error_all_pdus(rpc, "RPC ERROR: Failed to rebind the NFSv4 "
 			   "session to the reconnected socket");
 }

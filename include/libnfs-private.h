@@ -350,6 +350,16 @@ struct nfs4_slot {
         sequenceid4 seqid;
         int in_use;
 };
+
+enum nfs4_recovery_state {
+        NFS4_RECOVERY_IDLE,
+        NFS4_RECOVERY_RECONNECT,
+        NFS4_RECOVERY_PREPARE,
+        NFS4_RECOVERY_CREATE,
+        NFS4_RECOVERY_EXCHANGE,
+        NFS4_RECOVERY_RECLAIM,
+        NFS4_RECOVERY_FAILED
+};
 #endif /* HAVE_NFS4_2 */
 
 struct rpc_context {
@@ -467,6 +477,7 @@ struct rpc_context {
 	 * built is what keeps submission itself unbounded.
 	 */
 	sessionid4 nfs4_sessionid;
+	uint64_t nfs4_session_generation;
 	struct nfs4_slot *nfs4_slots;
 	uint32_t nfs4_slot_count;
 	uint32_t nfs4_slots_in_use;
@@ -474,6 +485,16 @@ struct rpc_context {
 	/* When the session next needs a SEQUENCE to keep its lease alive. */
 	uint64_t nfs4_renew_due;
 	int nfs4_session_valid;
+        /* The high-level client owns client identity and recovery credentials. */
+        void (*nfs4_recover)(struct rpc_context *, void *);
+        void *nfs4_recover_data;
+        int (*nfs4_bind_state)(struct rpc_context *, struct rpc_pdu *,
+                              COMPOUND4args *, uint32_t, uint32_t);
+        nfsstat4 (*nfs4_prepare_state)(struct rpc_context *, struct rpc_pdu *);
+        void (*nfs4_release_state)(struct rpc_context *, struct rpc_pdu *);
+        enum nfs4_recovery_state nfs4_recovery;
+        uint64_t nfs4_recovery_due;
+        uint32_t nfs4_recovery_attempts;
 #ifdef HAVE_MULTITHREADING
 	/*
 	 * The slot table has a lock of its own rather than sharing rpc_mutex,
@@ -783,8 +804,15 @@ rpc_cb cb;
         uint32_t nfs4_needs_slot:1;
         uint32_t nfs4_slot_held:1;
         uint32_t nfs4_slot_sent:1;
+        uint32_t nfs4_keepalive:1;
+        uint32_t nfs4_recovery_pdu:1;
+        uint32_t nfs4_recovery_readonly:1;
+        uint32_t nfs4_recovery_rejected:1;
         uint32_t nfs4_slot;
+        uint64_t nfs4_session_generation;
         uint32_t nfs4_seq_pos;
+        struct nfs4_pdu_binding *nfs4_bindings;
+        nfsstat4 nfs4_local_error;
         /* Only ordinary, replay-safe COMPOUND prefixes are eligible. */
         uint32_t nfs4_delay_maxres;
         uint32_t nfs4_delay_attempts;
@@ -871,6 +899,7 @@ int rpc_remove_pdu_from_queue(struct rpc_queue *q, struct rpc_pdu *remove_pdu);
 unsigned int rpc_hash_xid(struct rpc_context *rpc, uint32_t xid);
 struct rpc_pdu *rpc_allocate_pdu(struct rpc_context *rpc, int program, int version, int procedure, rpc_cb cb, void *private_data, zdrproc_t zdr_decode_fn, int zdr_bufsize);
 struct rpc_pdu *rpc_allocate_pdu2(struct rpc_context *rpc, int program, int version, int procedure, rpc_cb cb, void *private_data, zdrproc_t zdr_decode_fn, int zdr_bufsize, size_t alloc_hint, int iovcnt_hint);
+struct rpc_pdu *rpc_allocate_pdu2_auth(struct rpc_context *rpc, int program, int version, int procedure, rpc_cb cb, void *private_data, zdrproc_t zdr_decode_fn, int zdr_bufsize, size_t alloc_hint, int iovcnt_hint, const struct AUTH *auth);
 void pdu_set_timeout(struct rpc_context *rpc, struct rpc_pdu *pdu, uint64_t now_msecs);
 
 void rpc_free_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu);
@@ -1035,6 +1064,14 @@ struct nfs_context_internal {
        verifier4 verifier;
        char *client_name;
        uint64_t clientid;
+#ifdef HAVE_NFS4_2
+       sequenceid4 session_sequence;
+       struct AUTH *session_auth;
+       int reclaim_client;
+       unsigned int recovery_exchanges;
+       uint64_t client_generation;
+       struct nfsfh *open_files;
+#endif
        verifier4 setclientid_confirm;
        uint32_t open_counter;
        int has_lock_owner;
@@ -1149,7 +1186,32 @@ struct nfsfh {
         uint32_t open_seqid;
         uint32_t lock_seqid;
         struct stateid lock_stateid;
+#ifdef HAVE_NFS4_2
+        /* A stable local key binds queued operations to this open. Only
+         * wire_stateid is sent; it changes when the open is reclaimed. */
+        struct stateid wire_stateid;
+        struct nfs_context_internal *nfsi;
+        struct nfsfh *next;
+        struct AUTH *open_auth;
+        uint32_t share_access;
+        unsigned int recovery_refs;
+        int recovery_closed;
+        int recovery_valid;
+        int recovery_no_grace;
+        int recovery_locks;
+        nfsstat4 recovery_error;
+        uint64_t recovery_generation;
+        uint64_t write_generation;
+        unsigned int pending_writes;
+        verifier4 write_verifier;
+        int write_verifier_valid;
+#endif
 };
+
+#ifdef HAVE_NFS4_2
+int nfs42_release_open(struct nfsfh *fh);
+void nfs42_destroy_open_files(struct nfs_context_internal *nfsi);
+#endif
 
 void rpc_free_iovector(struct rpc_context *rpc, struct rpc_io_vectors *v);
 int rpc_add_iovector(struct rpc_context *rpc, struct rpc_io_vectors *v,
@@ -1290,12 +1352,21 @@ int nfs4_lseek_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
 int nfs4_session_init(struct rpc_context *rpc, const char *sessionid,
                       uint32_t slot_count);
 void nfs4_session_destroy(struct rpc_context *rpc);
-void nfs4_session_put_slot(struct rpc_context *rpc, uint32_t slotid,
+void nfs4_session_put_slot(struct rpc_context *rpc, struct rpc_pdu *pdu,
                            int rollback);
 int rpc_nfs4_session_is_valid(struct rpc_context *rpc);
 int nfs4_pdu_take_slot(struct rpc_context *rpc, struct rpc_pdu *pdu);
 int nfs4_pdu_retry_delay(struct rpc_context *rpc, struct rpc_pdu *pdu,
                         const COMPOUND4res *res);
+int nfs4_request_recovery(struct rpc_context *rpc, nfsstat4 status);
+int nfs4_pdu_retry_recovery(struct rpc_context *rpc, struct rpc_pdu *pdu,
+                           const COMPOUND4res *res);
+int nfs4_pdu_waits_for_recovery(struct rpc_context *rpc, struct rpc_pdu *pdu);
+void nfs4_recovery_prepare(struct rpc_context *rpc);
+void nfs4_recovery_failed(struct rpc_context *rpc);
+struct rpc_pdu *rpc_nfs4_recovery_task(struct rpc_context *rpc, rpc_cb cb,
+                                      COMPOUND4args *args, void *private_data,
+                                      const struct AUTH *auth);
 void nfs4_defer_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu);
 void nfs4_service_delayed(struct rpc_context *rpc);
 int nfs4_next_delay_msecs(struct rpc_context *rpc);

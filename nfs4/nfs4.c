@@ -383,6 +383,7 @@ nfs4_session_init(struct rpc_context *rpc, const char *sessionid,
 
         nfs4_session_lock(rpc);
         free(rpc->nfs4_slots);
+        rpc->nfs4_session_generation++;
         memcpy(rpc->nfs4_sessionid, sessionid, sizeof(sessionid4));
         rpc->nfs4_slots = slots;
         rpc->nfs4_slot_count = slot_count;
@@ -414,7 +415,7 @@ nfs4_session_destroy(struct rpc_context *rpc)
  */
 static int
 nfs4_session_get_slot(struct rpc_context *rpc, SEQUENCE4args *sargs,
-                      uint32_t *slotid)
+                      struct rpc_pdu *pdu)
 {
         uint32_t i = 0, n;
 
@@ -455,9 +456,10 @@ nfs4_session_get_slot(struct rpc_context *rpc, SEQUENCE4args *sargs,
         sargs->sa_slotid = i;
         sargs->sa_highest_slotid = rpc->nfs4_slot_count - 1;
         sargs->sa_cachethis = 0;
+        pdu->nfs4_slot = i;
+        pdu->nfs4_session_generation = rpc->nfs4_session_generation;
         nfs4_session_unlock(rpc);
 
-        *slotid = i;
         return 0;
 }
 
@@ -468,10 +470,14 @@ nfs4_session_get_slot(struct rpc_context *rpc, SEQUENCE4args *sargs,
  * is rejected for.
  */
 void
-nfs4_session_put_slot(struct rpc_context *rpc, uint32_t slotid, int rollback)
+nfs4_session_put_slot(struct rpc_context *rpc, struct rpc_pdu *pdu, int rollback)
 {
+        uint32_t slotid = pdu->nfs4_slot;
+
         nfs4_session_lock(rpc);
-        if (rpc->nfs4_slots && slotid < rpc->nfs4_slot_count) {
+        /* Old completions must not release a slot in a replacement session. */
+        if (rpc->nfs4_session_generation == pdu->nfs4_session_generation &&
+            rpc->nfs4_slots && slotid < rpc->nfs4_slot_count) {
                 if (rollback && rpc->nfs4_slots[slotid].seqid > 0) {
                         rpc->nfs4_slots[slotid].seqid--;
                 }
@@ -516,18 +522,15 @@ nfs4_pdu_note_sequence(struct rpc_context *rpc, struct rpc_pdu *pdu,
          */
 #ifdef HAVE_LIBKRB5
         if (rpc->sec == RPC_SEC_KRB5I || rpc->sec == RPC_SEC_KRB5P) {
-                uint32_t slotid;
-
                 if (nfs4_session_get_slot(rpc,
                         &args->argarray.argarray_val[0].nfs_argop4_u.opsequence,
-                        &slotid) < 0) {
+                        pdu) < 0) {
                         rpc_set_error(rpc, "NFSv4.2 session has no free slot. "
                                       "All %d are in use by requests that have "
                                       "not completed yet.",
                                       rpc->nfs4_slot_count);
                         return -1;
                 }
-                pdu->nfs4_slot = slotid;
                 pdu->nfs4_slot_held = 1;
                 rpc->nfs4_renew_due = rpc_current_time() +
                         NFS4_SESSION_RENEW_MSECS;
@@ -547,6 +550,25 @@ nfs4_pdu_note_sequence(struct rpc_context *rpc, struct rpc_pdu *pdu,
                 ((args->tag.utf8string_len + 3) & ~3u) + 4 + 4 + 4;
         pdu->nfs4_needs_slot = 1;
 
+        /* Only read-only compounds can be replayed after losing a reply cache. */
+        pdu->nfs4_recovery_readonly = 1;
+        {
+                uint32_t i;
+                for (i = 1; i < args->argarray.argarray_len; i++) {
+                        switch (args->argarray.argarray_val[i].argop) {
+                        case OP_PUTFH: case OP_PUTROOTFH:
+                        case OP_SAVEFH: case OP_RESTOREFH:
+                        case OP_LOOKUP: case OP_LOOKUPP:
+                        case OP_GETFH: case OP_GETATTR: case OP_ACCESS:
+                        case OP_READLINK: case OP_READDIR: case OP_READ:
+                                break;
+                        default:
+                                pdu->nfs4_recovery_readonly = 0;
+                                break;
+                        }
+                }
+        }
+
         return 0;
 }
 
@@ -560,14 +582,14 @@ int
 nfs4_pdu_take_slot(struct rpc_context *rpc, struct rpc_pdu *pdu)
 {
         SEQUENCE4args sargs;
-        uint32_t slotid, pos;
+        uint32_t pos;
 
         if (!pdu->nfs4_needs_slot || pdu->nfs4_slot_held) {
                 return 0;
         }
 
         memset(&sargs, 0, sizeof(sargs));
-        if (nfs4_session_get_slot(rpc, &sargs, &slotid) < 0) {
+        if (nfs4_session_get_slot(rpc, &sargs, pdu) < 0) {
                 return -1;
         }
 
@@ -589,7 +611,6 @@ nfs4_pdu_take_slot(struct rpc_context *rpc, struct rpc_pdu *pdu)
         assert(zdr_getpos(&pdu->zdr) <= pos);
         zdr_setpos(&pdu->zdr, pos);
 
-        pdu->nfs4_slot = slotid;
         pdu->nfs4_slot_held = 1;
 
         /*
@@ -617,6 +638,160 @@ nfs4_session_has_free_slot(struct rpc_context *rpc)
         nfs4_session_unlock(rpc);
 
         return free_slot;
+}
+
+#define NFS4_DELAY_MAX_ATTEMPTS 8
+#define NFS4_DELAY_BASE_MSECS   100u
+#define NFS4_DELAY_MAX_MSECS    1000u
+
+static uint32_t
+nfs4_retry_msecs(uint32_t attempts)
+{
+        return attempts < 4 ? NFS4_DELAY_BASE_MSECS << attempts :
+                NFS4_DELAY_MAX_MSECS;
+}
+
+int
+nfs4_request_recovery(struct rpc_context *rpc, nfsstat4 status)
+{
+        if ((status != NFS4ERR_BADSESSION && status != NFS4ERR_DEADSESSION) ||
+            !rpc->nfs4_recover || !rpc->auto_reconnect ||
+            rpc->nfs4_recovery == NFS4_RECOVERY_FAILED) {
+                return 0;
+        }
+        if (rpc->nfs4_recovery == NFS4_RECOVERY_IDLE) {
+                uint64_t now = rpc_current_time();
+                uint32_t delay;
+                if (now > rpc->nfs4_recovery_due + NFS4_SESSION_RENEW_MSECS) {
+                        rpc->nfs4_recovery_attempts = 0;
+                }
+                delay = nfs4_retry_msecs(rpc->nfs4_recovery_attempts);
+                if (rpc->nfs4_recovery_attempts < 4) {
+                        rpc->nfs4_recovery_attempts++;
+                }
+                rpc->nfs4_recovery_due = now + delay;
+                rpc->nfs4_recovery = NFS4_RECOVERY_RECONNECT;
+                RPC_LOG(rpc, 1, "NFSv4 session lost; scheduling recovery");
+        }
+        return 1;
+}
+
+void
+nfs4_recovery_failed(struct rpc_context *rpc)
+{
+        rpc->nfs4_recovery = NFS4_RECOVERY_FAILED;
+        rpc->nfs4_recovery_due = rpc_current_time() + NFS4_DELAY_MAX_MSECS;
+}
+
+int
+nfs4_pdu_waits_for_recovery(struct rpc_context *rpc, struct rpc_pdu *pdu)
+{
+        return pdu->nfs4_needs_slot && !pdu->nfs4_recovery_pdu &&
+                rpc->nfs4_recovery != NFS4_RECOVERY_IDLE &&
+                (rpc->nfs4_recovery != NFS4_RECOVERY_FAILED || rpc->auto_reconnect < 0);
+}
+
+int
+nfs4_pdu_retry_recovery(struct rpc_context *rpc, struct rpc_pdu *pdu,
+                        const COMPOUND4res *res)
+{
+        if (pdu->nfs4_recovery_pdu && !pdu->do_not_retry && !rpc->is_udp &&
+            pdu->msg.body.cbody.cred.oa_flavor == AUTH_SYS && res &&
+            res->status == NFS4ERR_DELAY && res->resarray.resarray_len == 1 &&
+            res->resarray.resarray_val[0].resop == OP_CREATE_SESSION &&
+            res->resarray.resarray_val[0].nfs_resop4_u.opcreatesession.csr_status == NFS4ERR_DELAY &&
+            (pdu->nfs4_delay_attempts < NFS4_DELAY_MAX_ATTEMPTS || rpc->auto_reconnect < 0)) {
+                uint32_t delay = nfs4_retry_msecs(pdu->nfs4_delay_attempts);
+                if (pdu->nfs4_delay_attempts < NFS4_DELAY_MAX_ATTEMPTS) {
+                        pdu->nfs4_delay_attempts++;
+                }
+                /* CREATE_SESSION has its own sequence; replay it unchanged. */
+                pdu->nfs4_delay_until = rpc_current_time() + delay;
+                return 1;
+        }
+        if (!pdu->nfs4_needs_slot || !pdu->nfs4_slot_held ||
+            pdu->nfs4_session_generation != rpc->nfs4_session_generation ||
+            !res || res->resarray.resarray_len != 1 ||
+            res->resarray.resarray_val[0].resop != OP_SEQUENCE ||
+            res->resarray.resarray_val[0].nfs_resop4_u.opsequence.sr_status != res->status ||
+            !nfs4_request_recovery(rpc, res->status)) {
+                return 0;
+        }
+        if (pdu->nfs4_recovery_pdu || pdu->do_not_retry) {
+                return 0;
+        }
+        /* A first-operation SEQUENCE rejection proves that none of the
+         * application's operations ran, including OPEN or namespace changes. */
+        pdu->nfs4_recovery_rejected = 1;
+        /* The normal deferred-PDU path retains ownership through reconnect. */
+        pdu->nfs4_delay_until = rpc_current_time();
+        return 1;
+}
+
+/* Called on a fresh connection, before any ordinary request can be sent. */
+void
+nfs4_recovery_prepare(struct rpc_context *rpc)
+{
+        struct rpc_queue failed = {0};
+        struct rpc_pdu *pdu, *next;
+
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif
+        assert(rpc->waitpdu_len == 0 && rpc->pdu == NULL);
+        for (pdu = rpc->outqueue.head; pdu; pdu = next) {
+                uint32_t pos;
+                next = pdu->next;
+                if (!pdu->nfs4_needs_slot) {
+                        continue;
+                }
+                assert(pdu->out.num_done == 0);
+                if (pdu->nfs4_slot_sent && !pdu->nfs4_recovery_readonly &&
+                    !pdu->nfs4_recovery_rejected) {
+                        rpc_remove_pdu_from_queue(&rpc->outqueue, pdu);
+                        rpc->stats.outqueue_len--;
+                        rpc_enqueue(&failed, pdu);
+                        continue;
+                }
+                if (pdu->nfs4_slot_held) {
+                        nfs4_session_put_slot(rpc, pdu, !pdu->nfs4_slot_sent);
+                        pdu->nfs4_slot_held = 0;
+                }
+                pdu->nfs4_slot_sent = 0;
+                pdu->nfs4_recovery_rejected = 0;
+                if (pdu->in.base) {
+                        /* READ temporarily uses zdr for decoding its reply. */
+                        zdr_destroy(&pdu->zdr);
+                        pdu->zdr_decode_buf = NULL;
+                        pdu->free_pdu = pdu->free_zdr = 0;
+                        pdu->read_count = 0;
+                        zdrmem_create(&pdu->zdr, &pdu->outdata.data[4],
+                                      pdu->out.total_size - 4, ZDR_ENCODE);
+                        zdr_setpos(&pdu->zdr, pdu->out.total_size - 4);
+                }
+                pdu->xid = rpc->xid++;
+                pos = zdr_getpos(&pdu->zdr);
+                zdr_setpos(&pdu->zdr, 0);
+                (void)zdr_uint32_t(&pdu->zdr, &pdu->xid);
+                zdr_setpos(&pdu->zdr, pos);
+                pdu->pdu_stats.xid = pdu->msg.xid = pdu->xid;
+        }
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+        }
+#endif
+        /* Live callbacks may enqueue work. Never run these under rpc_mutex. */
+        for (pdu = failed.head; pdu; pdu = next) {
+                next = pdu->next;
+                pdu->next = NULL;
+                pdu->cb(rpc, RPC_STATUS_ERROR,
+                        "NFSv4 session reply cache lost; operation outcome is uncertain",
+                        pdu->private_data);
+                rpc_free_pdu(rpc, pdu);
+        }
 }
 
 /* RFC 8881 15.1.1.3: replay only if no state-changing op has succeeded. */
@@ -649,40 +824,54 @@ nfs4_pdu_note_delay(struct rpc_pdu *pdu, const COMPOUND4args *args)
         }
 }
 
-#define NFS4_DELAY_MAX_ATTEMPTS 8
-#define NFS4_DELAY_BASE_MSECS   100u
-#define NFS4_DELAY_MAX_MSECS    1000u
-
 int
 nfs4_pdu_retry_delay(struct rpc_context *rpc, struct rpc_pdu *pdu,
                      const COMPOUND4res *res)
 {
         uint32_t count, delay, pos;
+        int sequence_delay;
 
-        /* Leave v4.0, GSS, zero-copy I/O and SEQUENCE errors unchanged. */
+        /* Leave v4.0, GSS and zero-copy I/O unchanged. */
         if (!pdu->nfs4_delay_maxres || rpc->nfs4_minorversion != 2 ||
             rpc->is_udp || pdu->msg.body.cbody.cred.oa_flavor != AUTH_SYS || pdu->in.base ||
             pdu->do_not_retry || !pdu->nfs4_slot_held || !res ||
-            res->status != NFS4ERR_DELAY ||
-            pdu->nfs4_delay_attempts >= NFS4_DELAY_MAX_ATTEMPTS) {
+            (res->status != NFS4ERR_DELAY && res->status != NFS4ERR_GRACE) ||
+            (pdu->nfs4_delay_attempts >= NFS4_DELAY_MAX_ATTEMPTS &&
+             !(rpc->auto_reconnect < 0 &&
+               (pdu->nfs4_recovery_pdu || res->status == NFS4ERR_GRACE)))) {
                 return 0;
         }
         count = res->resarray.resarray_len;
-        if (count < 2 || count > pdu->nfs4_delay_maxres ||
-            res->resarray.resarray_val[0].resop != OP_SEQUENCE ||
-            res->resarray.resarray_val[0].nfs_resop4_u.opsequence.sr_status != NFS4_OK) {
+        if (!count || count > pdu->nfs4_delay_maxres ||
+            res->resarray.resarray_val[0].resop != OP_SEQUENCE) {
+                return 0;
+        }
+        sequence_delay = (pdu->nfs4_keepalive || pdu->nfs4_recovery_pdu) && count == 1 &&
+                res->resarray.resarray_val[0].nfs_resop4_u.opsequence.sr_status == NFS4ERR_DELAY;
+        if (!sequence_delay && (count < 2 ||
+            res->resarray.resarray_val[0].nfs_resop4_u.opsequence.sr_status != NFS4_OK)) {
                 return 0;
         }
 
-        /* A new logical request needs a new sequence, not a transport replay. */
-        nfs4_session_put_slot(rpc, pdu->nfs4_slot, 0);
-        pdu->nfs4_slot_held = 0;
-        pdu->nfs4_slot_sent = 0;
-        delay = pdu->nfs4_delay_attempts < 4 ?
-                NFS4_DELAY_BASE_MSECS << pdu->nfs4_delay_attempts :
-                NFS4_DELAY_MAX_MSECS;
-        pdu->nfs4_delay_attempts++;
+        /* A failed keepalive SEQUENCE is retried with its original slot/id. */
+        if (!sequence_delay) {
+                /* A completed SEQUENCE needs a new logical request. */
+                nfs4_session_put_slot(rpc, pdu, 0);
+                pdu->nfs4_slot_held = 0;
+                pdu->nfs4_slot_sent = 0;
+        }
+
+        delay = nfs4_retry_msecs(pdu->nfs4_delay_attempts);
+        if (pdu->nfs4_delay_attempts < NFS4_DELAY_MAX_ATTEMPTS) {
+                pdu->nfs4_delay_attempts++;
+        }
         pdu->nfs4_delay_until = rpc_current_time() + delay;
+
+        if (sequence_delay) {
+                RPC_LOG(rpc, 2, "NFS4ERR_DELAY: retry keepalive %u in %u ms",
+                        pdu->nfs4_delay_attempts, delay);
+                return 1;
+        }
 
 #ifdef HAVE_MULTITHREADING
         if (rpc->multithreading_enabled) {
@@ -752,6 +941,11 @@ nfs4_next_delay_msecs(struct rpc_context *rpc)
                 nfs_mt_mutex_unlock(&rpc->rpc_mutex);
         }
 #endif
+        if ((rpc->nfs4_recovery == NFS4_RECOVERY_RECONNECT ||
+             rpc->nfs4_recovery == NFS4_RECOVERY_FAILED) && rpc->is_connected &&
+            (due == 0 || rpc->nfs4_recovery_due < due)) {
+                due = rpc->nfs4_recovery_due;
+        }
         if (due == 0) {
                 return -1;
         }
@@ -785,7 +979,11 @@ nfs4_service_delayed(struct rpc_context *rpc)
                 rpc->nfs4_delay_queue_len--;
                 pdu->nfs4_delay_until = 0;
                 pdu_set_timeout(rpc, pdu, now);
-                rpc_add_to_outqueue_lowp(rpc, pdu);
+                if (pdu->nfs4_recovery_pdu) {
+                        rpc_add_to_outqueue_highp(rpc, pdu);
+                } else {
+                        rpc_add_to_outqueue_lowp(rpc, pdu);
+                }
         }
 #ifdef HAVE_MULTITHREADING
         if (rpc->multithreading_enabled) {
@@ -810,7 +1008,7 @@ nfs4_requeue_delayed(struct rpc_context *rpc)
 }
 
 /*
- * Send a COMPOUND holding exactly one session management operation.
+ * Send a COMPOUND holding exactly one session management operation or renewal.
  *
  * BIND_CONN_TO_SESSION and DESTROY_SESSION are both operations that RFC 8881
  * requires to travel on their own, without a leading SEQUENCE, so they take
@@ -839,12 +1037,20 @@ nfs4_session_op_task(struct rpc_context *rpc, rpc_cb cb, nfs_argop4 *op,
         args.argarray.argarray_len = 1;
         args.argarray.argarray_val = op;
 
+        pdu->nfs4_keepalive = op->argop == OP_SEQUENCE;
+        if (nfs4_pdu_note_sequence(rpc, pdu, &args, zdr_getpos(&pdu->zdr)) < 0) {
+                rpc_free_pdu(rpc, pdu);
+                return NULL;
+        }
+
         if (zdr_COMPOUND4args(&pdu->zdr, &args) == 0) {
                 rpc_set_error(rpc, "ZDR error: Failed to encode COMPOUND4args "
                               "for %s", what);
                 rpc_free_pdu(rpc, pdu);
                 return NULL;
         }
+
+        nfs4_pdu_note_delay(pdu, &args);
 
         if (rpc_queue_pdu2(rpc, pdu, prio) != 0) {
                 rpc_set_error(rpc, "Failed to queue pdu for NFS4/%s", what);
@@ -905,24 +1111,20 @@ rpc_nfs4_destroy_session_task(struct rpc_context *rpc, rpc_cb cb,
  * one renews the session's lease, which is what keeps an otherwise idle
  * connection's session from being reaped by the server.
  *
- * It goes through the ordinary COMPOUND path so that it takes a slot and is
- * sequenced like anything else.
+ * It takes an ordinary slot, but a DELAY on this standalone SEQUENCE must
+ * replay the same request rather than invalidate an otherwise live session.
  */
 struct rpc_pdu *
 rpc_nfs4_renew_session_task(struct rpc_context *rpc, rpc_cb cb,
                             void *private_data)
 {
-        COMPOUND4args args;
         nfs_argop4 op;
 
         memset(&op, 0, sizeof(op));
         op.argop = OP_SEQUENCE;
 
-        memset(&args, 0, sizeof(args));
-        args.argarray.argarray_len = 1;
-        args.argarray.argarray_val = &op;
-
-        return rpc_nfs4_compound_task(rpc, cb, &args, private_data);
+        return nfs4_session_op_task(rpc, cb, &op, PDU_Q_PRIO_LOW, private_data,
+                                    "SEQUENCE");
 }
 
 int
@@ -956,17 +1158,46 @@ struct rpc_pdu *rpc_nfs4_null_task(struct rpc_context *rpc, rpc_cb cb,
 	return pdu;
 }
 
-struct rpc_pdu *rpc_nfs4_compound_task2(struct rpc_context *rpc, rpc_cb cb,
+static bool_t
+nfs4_encode_compound(struct rpc_context *rpc, struct rpc_pdu *pdu,
+                     COMPOUND4args *args)
+{
+#ifdef HAVE_NFS4_2
+        uint32_t i;
+
+        if (pdu->nfs4_needs_slot && !pdu->nfs4_recovery_pdu &&
+            rpc->nfs4_bind_state) {
+                if (!zdr_utf8str_cs(&pdu->zdr, &args->tag) ||
+                    !zdr_uint32_t(&pdu->zdr, &args->minorversion) ||
+                    !zdr_uint32_t(&pdu->zdr, &args->argarray.argarray_len)) {
+                        return 0;
+                }
+                for (i = 0; i < args->argarray.argarray_len; i++) {
+                        nfs_argop4 *op = &args->argarray.argarray_val[i];
+                        if (rpc->nfs4_bind_state(rpc, pdu, args, i,
+                                                zdr_getpos(&pdu->zdr)) < 0 ||
+                            !zdr_nfs_argop4(&pdu->zdr, op)) {
+                                return 0;
+                        }
+                }
+                return 1;
+        }
+#endif
+        return zdr_COMPOUND4args(&pdu->zdr, args);
+}
+
+static struct rpc_pdu *nfs4_compound_task(struct rpc_context *rpc, rpc_cb cb,
                                         struct COMPOUND4args *args,
                                         void *private_data,
-                                        size_t alloc_hint)
+                                        size_t alloc_hint,
+                                        const struct AUTH *auth, int recovery)
 {
 	struct rpc_pdu *pdu;
 
-	pdu = rpc_allocate_pdu2(rpc, NFS4_PROGRAM, NFS_V4, NFSPROC4_COMPOUND,
+	pdu = rpc_allocate_pdu2_auth(rpc, NFS4_PROGRAM, NFS_V4, NFSPROC4_COMPOUND,
                                cb, private_data, (zdrproc_t)zdr_COMPOUND4res,
                                sizeof(COMPOUND4res),
-                               alloc_hint, 0);
+                               alloc_hint, 0, auth);
 	if (pdu == NULL) {
 		rpc_set_error(rpc, "Out of memory. Failed to allocate pdu for "
                               "NFS4/COMPOUND call");
@@ -974,6 +1205,7 @@ struct rpc_pdu *rpc_nfs4_compound_task2(struct rpc_context *rpc, rpc_cb cb,
 	}
 
 #ifdef HAVE_NFS4_2
+	pdu->nfs4_recovery_pdu = recovery;
 	/*
 	 * The minor version and the session both belong to the connection, not
 	 * to each caller, so they are stamped here rather than at every one of
@@ -996,7 +1228,7 @@ struct rpc_pdu *rpc_nfs4_compound_task2(struct rpc_context *rpc, rpc_cb cb,
 	}
 #endif /* HAVE_NFS4_2 */
 
-	if (zdr_COMPOUND4args(&pdu->zdr,  args) == 0) {
+	if (nfs4_encode_compound(rpc, pdu, args) == 0) {
 		rpc_set_error(rpc, "ZDR error: Failed to encode COMPOUND4args");
 		rpc_free_pdu(rpc, pdu);
 		return NULL;
@@ -1006,7 +1238,7 @@ struct rpc_pdu *rpc_nfs4_compound_task2(struct rpc_context *rpc, rpc_cb cb,
         nfs4_pdu_note_delay(pdu, args);
 #endif
 
-	if (rpc_queue_pdu(rpc, pdu) != 0) {
+	if (rpc_queue_pdu2(rpc, pdu, recovery ? PDU_Q_PRIO_HI : PDU_Q_PRIO_LOW) != 0) {
 		rpc_set_error(rpc, "Out of memory. Failed to queue pdu for "
                               "NFS4/COMPOUND4 call");
 		return NULL;
@@ -1015,6 +1247,22 @@ struct rpc_pdu *rpc_nfs4_compound_task2(struct rpc_context *rpc, rpc_cb cb,
 	return pdu;
 }
 
+struct rpc_pdu *rpc_nfs4_compound_task2(struct rpc_context *rpc, rpc_cb cb,
+                                      COMPOUND4args *args, void *private_data,
+                                      size_t alloc_hint)
+{
+        return nfs4_compound_task(rpc, cb, args, private_data, alloc_hint,
+                                 rpc->auth, 0);
+}
+
+#ifdef HAVE_NFS4_2
+struct rpc_pdu *rpc_nfs4_recovery_task(struct rpc_context *rpc, rpc_cb cb,
+                                     COMPOUND4args *args, void *private_data,
+                                     const struct AUTH *auth)
+{
+        return nfs4_compound_task(rpc, cb, args, private_data, 0, auth, 1);
+}
+#endif
 
 struct rpc_pdu *rpc_nfs4_compound_task(struct rpc_context *rpc, rpc_cb cb,
                                        struct COMPOUND4args *args,
@@ -1084,7 +1332,7 @@ struct rpc_pdu *rpc_nfs4_readv_task(struct rpc_context *rpc, rpc_cb cb,
 	}
 #endif /* HAVE_NFS4_2 */
 
-	if (zdr_COMPOUND4args(&pdu->zdr,  args) == 0) {
+	if (nfs4_encode_compound(rpc, pdu, args) == 0) {
 		rpc_set_error(rpc, "ZDR error: Failed to encode COMPOUND4args");
 		rpc_free_pdu(rpc, pdu);
 		return NULL;
@@ -1186,7 +1434,7 @@ struct rpc_pdu *rpc_nfs4_writev_task(struct rpc_context *rpc, rpc_cb cb,
 	}
 #endif /* HAVE_NFS4_2 */
 
-	if (zdr_COMPOUND4args(&pdu->zdr,  args) == 0) {
+	if (nfs4_encode_compound(rpc, pdu, args) == 0) {
 		rpc_set_error(rpc, "ZDR error: Failed to encode COMPOUND4args");
 		rpc_free_pdu(rpc, pdu);
 		return NULL;

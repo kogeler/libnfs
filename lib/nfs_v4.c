@@ -255,6 +255,10 @@ static uint32_t rwmax_attributes[1] = {
 static int
 nfs4_open_async_internal(struct nfs_context *nfs, struct nfs4_cb_data *data,
                          int flags, int mode);
+#ifdef HAVE_NFS4_2
+static void nfs42_state_lock(struct nfs_context_internal *nfsi);
+static void nfs42_state_unlock(struct nfs_context_internal *nfsi);
+#endif
 
 /* Caller will free the returned path. */
 static char *
@@ -790,8 +794,16 @@ nfs4_op_close(struct nfs_context *nfs, nfs_argop4 *op, struct nfsfh *fh)
 {
         CLOSE4args *clargs;
         int i = 0;
+        int commit = fh->is_dirty;
 
-        if (fh->is_dirty) {
+#ifdef HAVE_NFS4_2
+        if (fh->nfsi) {
+                nfs42_state_lock(fh->nfsi);
+                commit = fh->is_dirty && !fh->recovery_error;
+                nfs42_state_unlock(fh->nfsi);
+        }
+#endif
+        if (commit) {
                 i += nfs4_op_commit(nfs, &op[i]);
         }
 
@@ -1021,7 +1033,17 @@ nfs4_op_write(struct nfs_context *nfs, nfs_argop4 *op, struct nfsfh *fh,
                 wargs->stable = DATA_SYNC4;
         } else {
                 wargs->stable = UNSTABLE4;
+#ifdef HAVE_NFS4_2
+                if (fh->nfsi) {
+                        nfs42_state_lock(fh->nfsi);
+                        fh->write_generation++;
+                        nfs42_state_unlock(fh->nfsi);
+                } else {
+                        fh->is_dirty = 1;
+                }
+#else
                 fh->is_dirty = 1;
+#endif
         }
         wargs->data.data_len = count;
         wargs->data.data_val = discard_const(buf);
@@ -1248,6 +1270,388 @@ nfs4_op_getattr(struct nfs_context *nfs, nfs_argop4 *op,
  *          Caller must free op.
  */
 #ifdef HAVE_NFS4_2
+static void
+nfs42_state_lock(struct nfs_context_internal *nfsi)
+{
+#ifdef HAVE_MULTITHREADING
+        nfs_mt_mutex_lock(&nfsi->nfs_mutex);
+#else
+        (void)nfsi;
+#endif
+}
+
+static void
+nfs42_state_unlock(struct nfs_context_internal *nfsi)
+{
+#ifdef HAVE_MULTITHREADING
+        nfs_mt_mutex_unlock(&nfsi->nfs_mutex);
+#else
+        (void)nfsi;
+#endif
+}
+
+static struct AUTH *
+nfs42_copy_auth(const struct AUTH *auth)
+{
+        struct AUTH *saved;
+        size_t cred_len = auth->ah_cred.oa_length;
+        size_t verf_len = auth->ah_verf.oa_length;
+        char *buffer;
+
+        if (cred_len > SIZE_MAX - sizeof(*saved) ||
+            verf_len > SIZE_MAX - sizeof(*saved) - cred_len) {
+                return NULL;
+        }
+        saved = calloc(1, sizeof(*saved) + cred_len + verf_len);
+        if (!saved) {
+                return NULL;
+        }
+        saved->ah_cred = auth->ah_cred;
+        saved->ah_verf = auth->ah_verf;
+        buffer = (char *)(saved + 1);
+        saved->ah_cred.oa_base = buffer;
+        if (cred_len) {
+                memcpy(buffer, auth->ah_cred.oa_base, cred_len);
+        }
+        saved->ah_verf.oa_base = buffer + cred_len;
+        if (verf_len) {
+                memcpy(buffer + cred_len, auth->ah_verf.oa_base, verf_len);
+        }
+        return saved;
+}
+
+/* Caller holds nfs_mutex. Return whether the last reference was released. */
+static int
+nfs42_put_open_locked(struct nfsfh *fh)
+{
+        assert(fh->recovery_refs);
+        if (--fh->recovery_refs) {
+                return 0;
+        }
+        LIBNFS_LIST_REMOVE(&fh->nfsi->open_files, fh);
+        fh->nfsi = NULL;
+        free(fh->open_auth);
+        fh->open_auth = NULL;
+        return 1;
+}
+
+int
+nfs42_release_open(struct nfsfh *fh)
+{
+        struct nfs_context_internal *nfsi = fh->nfsi;
+        int last;
+
+        nfs42_state_lock(nfsi);
+        fh->recovery_closed = 1;
+        last = nfs42_put_open_locked(fh);
+        nfs42_state_unlock(nfsi);
+        return last;
+}
+
+static void
+nfs42_put_open(struct nfsfh *fh)
+{
+        struct nfs_context_internal *nfsi = fh->nfsi;
+        int last;
+
+        nfs42_state_lock(nfsi);
+        last = nfs42_put_open_locked(fh);
+        nfs42_state_unlock(nfsi);
+        if (last) {
+                nfs_free_nfsfh(fh);
+        }
+}
+
+/* RPC destruction has cancelled every request before this is called. */
+void
+nfs42_destroy_open_files(struct nfs_context_internal *nfsi)
+{
+        while (nfsi->open_files) {
+                struct nfsfh *fh = nfsi->open_files;
+                assert(fh->recovery_refs == 1);
+                nfs_free_nfsfh(fh);
+        }
+}
+
+static int
+nfs42_register_open(struct nfs_context *nfs, struct nfsfh *fh, int flags)
+{
+        struct rpc_pdu *pdu = rpc_get_pdu(nfs->rpc);
+        struct rpc_msg call = {0};
+        struct AUTH auth = {0};
+        ZDR zdr;
+
+        if (!nfs->rpc->nfs4_recover) {
+                return 0;
+        }
+        /* rpc->auth may already belong to a different FUSE caller. Decode
+         * the credentials that actually authorized this OPEN instead. */
+        if (!pdu) {
+                return -1;
+        }
+        zdrmem_create(&zdr, &pdu->outdata.data[4], pdu->outdata.size - 4,
+                      ZDR_DECODE);
+        if (!zdr_callmsg(nfs->rpc, &zdr, &call)) {
+                zdr_destroy(&zdr);
+                return -1;
+        }
+        auth.ah_cred = call.body.cbody.cred;
+        auth.ah_verf = call.body.cbody.verf;
+        fh->open_auth = nfs42_copy_auth(&auth);
+        zdr_destroy(&zdr);
+        if (!fh->open_auth) {
+                return -1;
+        }
+        fh->share_access = flags & O_WRONLY ? OPEN4_SHARE_ACCESS_WRITE :
+                flags & O_RDWR ? OPEN4_SHARE_ACCESS_BOTH : OPEN4_SHARE_ACCESS_READ;
+        fh->wire_stateid = fh->stateid;
+        /* OPEN owners are unique within this context, including across
+         * client recovery. Do not confuse a server-reused stateid with an
+         * older open that still has queued requests. */
+        fh->stateid.seqid = fh->open_owner;
+        fh->nfsi = nfs->nfsi;
+        fh->recovery_refs = 1;
+        fh->recovery_valid = 1;
+        nfs42_state_lock(nfs->nfsi);
+        fh->recovery_generation = nfs->nfsi->client_generation;
+        LIBNFS_LIST_ADD(&nfs->nfsi->open_files, fh);
+        nfs42_state_unlock(nfs->nfsi);
+        return 0;
+}
+
+struct nfs4_pdu_binding {
+        struct nfs4_pdu_binding *next;
+        struct nfsfh *fh;
+        uint32_t pos;
+        int lock;
+        int write;
+        int close;
+};
+
+static stateid4 *
+nfs42_op_stateid(nfs_argop4 *op, int *lock)
+{
+        *lock = 0;
+        switch (op->argop) {
+        case OP_READ: return &op->nfs_argop4_u.opread.stateid;
+        case OP_WRITE: return &op->nfs_argop4_u.opwrite.stateid;
+        case OP_SETATTR: return &op->nfs_argop4_u.opsetattr.stateid;
+        case OP_CLOSE: return &op->nfs_argop4_u.opclose.open_stateid;
+        case OP_ALLOCATE: return &op->nfs_argop4_u.opallocate.aa_stateid;
+        case OP_DEALLOCATE: return &op->nfs_argop4_u.opdeallocate.da_stateid;
+        case OP_SEEK: return &op->nfs_argop4_u.opseek.sa_stateid;
+        case OP_READ_PLUS: return &op->nfs_argop4_u.opreadplus.rpa_stateid;
+        case OP_WRITE_SAME: return &op->nfs_argop4_u.opwritesame.wsa_stateid;
+        case OP_LOCK:
+                if (op->nfs_argop4_u.oplock.locker.new_lock_owner) {
+                        return &op->nfs_argop4_u.oplock.locker.locker4_u.open_owner.open_stateid;
+                }
+                *lock = 1;
+                return &op->nfs_argop4_u.oplock.locker.locker4_u.lock_owner.lock_stateid;
+        case OP_LOCKU:
+                *lock = 1;
+                return &op->nfs_argop4_u.oplocku.lock_stateid;
+        default: return NULL;
+        }
+}
+
+static clientid4 *
+nfs42_op_clientid(nfs_argop4 *op)
+{
+        switch (op->argop) {
+        case OP_OPEN: return &op->nfs_argop4_u.opopen.owner.clientid;
+        case OP_LOCKT: return &op->nfs_argop4_u.oplockt.owner.clientid;
+        case OP_LOCK:
+                if (op->nfs_argop4_u.oplock.locker.new_lock_owner) {
+                        return &op->nfs_argop4_u.oplock.locker.locker4_u.open_owner.lock_owner.clientid;
+                }
+                break;
+        default: break;
+        }
+        return NULL;
+}
+
+static int
+nfs42_bind_state(struct rpc_context *rpc, struct rpc_pdu *pdu,
+                  COMPOUND4args *args, uint32_t index, uint32_t pos)
+{
+        struct nfs_context *nfs = rpc->nfs4_recover_data;
+        struct nfs4_pdu_binding *binding;
+        struct nfsfh *fh = NULL;
+        nfs_argop4 *op = &args->argarray.argarray_val[index];
+        stateid4 *stateid;
+        int lock;
+
+        stateid = nfs42_op_stateid(op, &lock);
+        if (!stateid && !nfs42_op_clientid(op)) {
+                return 0;
+        }
+        nfs42_state_lock(nfs->nfsi);
+        if (stateid) {
+                for (fh = nfs->nfsi->open_files; fh; fh = fh->next) {
+                        struct stateid *id = lock ? &fh->lock_stateid : &fh->stateid;
+                        if (id->seqid == stateid->seqid &&
+                            !memcmp(id->other, stateid->other, sizeof(id->other))) {
+                                break;
+                        }
+                }
+        }
+        if (!fh && !nfs42_op_clientid(op)) {
+                nfs42_state_unlock(nfs->nfsi);
+                return 0;
+        }
+        binding = calloc(1, sizeof(*binding));
+        if (!binding) {
+                nfs42_state_unlock(nfs->nfsi);
+                return -1;
+        }
+        binding->fh = fh;
+        binding->pos = pos;
+        binding->lock = lock;
+        binding->write = op->argop == OP_WRITE || op->argop == OP_WRITE_SAME;
+        binding->close = op->argop == OP_CLOSE;
+        if (fh) {
+                fh->recovery_refs++;
+                if (binding->write) {
+                        fh->pending_writes++;
+                }
+        }
+        LIBNFS_LIST_ADD(&pdu->nfs4_bindings, binding);
+        nfs42_state_unlock(nfs->nfsi);
+        return 0;
+}
+
+static nfsstat4
+nfs42_prepare_state(struct rpc_context *rpc, struct rpc_pdu *pdu)
+{
+        struct nfs_context *nfs = rpc->nfs4_recover_data;
+        struct nfs4_pdu_binding *binding;
+        nfsstat4 status = NFS4_OK;
+        uint32_t end = zdr_getpos(&pdu->zdr);
+
+        if (!pdu->nfs4_recovery_pdu && rpc->nfs4_recovery == NFS4_RECOVERY_FAILED) {
+                return NFS4ERR_IO;
+        }
+        nfs42_state_lock(nfs->nfsi);
+        for (binding = pdu->nfs4_bindings; binding; binding = binding->next) {
+                nfs_argop4 op = {0};
+                ZDR decode;
+                stateid4 *stateid;
+                clientid4 *clientid;
+                int lock;
+
+                if (binding->fh && binding->fh->recovery_error &&
+                    !(binding->close && binding->fh->recovery_valid)) {
+                        status = binding->fh->recovery_error;
+                        break;
+                }
+                zdrmem_create(&decode, pdu->zdr.buf, end, ZDR_DECODE);
+                zdr_setpos(&decode, binding->pos);
+                if (!zdr_nfs_argop4(&decode, &op)) {
+                        zdr_destroy(&decode);
+                        status = NFS4ERR_IO;
+                        break;
+                }
+                stateid = nfs42_op_stateid(&op, &lock);
+                if (binding->fh && stateid && !binding->lock) {
+                        stateid->seqid = binding->fh->wire_stateid.seqid;
+                        memcpy(stateid->other, binding->fh->wire_stateid.other,
+                               sizeof(stateid->other));
+                }
+                clientid = nfs42_op_clientid(&op);
+                if (clientid) {
+                        *clientid = nfs->nfsi->clientid;
+                }
+                zdr_setpos(&pdu->zdr, binding->pos);
+                if (!zdr_nfs_argop4(&pdu->zdr, &op)) {
+                        status = NFS4ERR_IO;
+                }
+                zdr_destroy(&decode);
+                if (status) {
+                        break;
+                }
+        }
+        zdr_setpos(&pdu->zdr, end);
+        nfs42_state_unlock(nfs->nfsi);
+        return status;
+}
+
+static void
+nfs42_release_state(struct rpc_context *rpc _U_, struct rpc_pdu *pdu)
+{
+        while (pdu->nfs4_bindings) {
+                struct nfs4_pdu_binding *binding = pdu->nfs4_bindings;
+                pdu->nfs4_bindings = binding->next;
+                if (binding->fh) {
+                        if (binding->write) {
+                                nfs42_state_lock(binding->fh->nfsi);
+                                assert(binding->fh->pending_writes);
+                                binding->fh->pending_writes--;
+                                nfs42_state_unlock(binding->fh->nfsi);
+                        }
+                        nfs42_put_open(binding->fh);
+                }
+                free(binding);
+        }
+}
+
+static int
+nfs42_note_write(struct nfs_context *nfs, struct nfsfh *fh,
+                  const verifier4 verifier, stable_how4 committed)
+{
+        int lost;
+
+        if (!fh->nfsi) {
+                return 0;
+        }
+        nfs42_state_lock(fh->nfsi);
+        lost = fh->is_dirty && fh->write_verifier_valid &&
+                memcmp(fh->write_verifier, verifier, sizeof(verifier4));
+        if (lost) {
+                fh->recovery_error = NFS4ERR_IO;
+        } else if (committed == UNSTABLE4) {
+                fh->is_dirty = 1;
+                fh->write_verifier_valid = 1;
+                memcpy(fh->write_verifier, verifier, sizeof(verifier4));
+        }
+        nfs42_state_unlock(fh->nfsi);
+        if (lost) {
+                nfs_set_error(nfs, "NFSv4 WRITE verifier changed; unstable data was lost");
+        }
+        return lost;
+}
+
+static int
+nfs42_check_commit(struct nfs_context *nfs, struct nfsfh *fh,
+                    const COMPOUND4res *res)
+{
+        uint32_t i;
+        int lost = 0;
+
+        if (!fh->nfsi) {
+                return 0;
+        }
+        nfs42_state_lock(fh->nfsi);
+        for (i = 0; i < res->resarray.resarray_len; i++) {
+                const nfs_resop4 *op = &res->resarray.resarray_val[i];
+                if (op->resop == OP_COMMIT && op->nfs_resop4_u.opcommit.status == NFS4_OK) {
+                        lost = fh->is_dirty && fh->write_verifier_valid &&
+                                memcmp(fh->write_verifier,
+                                       op->nfs_resop4_u.opcommit.COMMIT4res_u.resok4.writeverf,
+                                       sizeof(verifier4));
+                        break;
+                }
+        }
+        if (lost) {
+                fh->recovery_error = NFS4ERR_IO;
+        }
+        nfs42_state_unlock(fh->nfsi);
+        if (lost) {
+                nfs_set_error(nfs, "NFSv4 COMMIT verifier changed; unstable data was lost");
+        }
+        return lost;
+}
+
 /*
  * NFSv4.2 session establishment.
  *
@@ -1339,6 +1743,365 @@ nfs42_op_reclaim_complete(struct nfs_context *nfs _U_, nfs_argop4 *op)
         return 1;
 }
 
+static void nfs42_recover_session(struct rpc_context *rpc, void *private_data);
+static void nfs42_reclaim_next(struct nfs_context *nfs);
+
+static void
+nfs42_recover_exchange_cb(struct rpc_context *rpc, int status,
+                          void *command_data, void *private_data)
+{
+        struct nfs_context *nfs = private_data;
+        COMPOUND4res *res = command_data;
+        EXCHANGE_ID4resok *exchanged;
+
+        if (status == RPC_STATUS_CANCEL) {
+                return;
+        }
+        if (status != RPC_STATUS_SUCCESS || !res || res->status != NFS4_OK ||
+            res->resarray.resarray_len != 1 ||
+            res->resarray.resarray_val[0].resop != OP_EXCHANGE_ID ||
+            res->resarray.resarray_val[0].nfs_resop4_u.opexchangeid.eir_status != NFS4_OK) {
+                nfs4_recovery_failed(rpc);
+                RPC_LOG(rpc, 1, "NFSv4 client recovery: EXCHANGE_ID failed");
+                return;
+        }
+        exchanged = &res->resarray.resarray_val[0].nfs_resop4_u.opexchangeid.EXCHANGE_ID4res_u.eir_resok4;
+        nfs42_state_lock(nfs->nfsi);
+        nfs->nfsi->clientid = exchanged->eir_clientid;
+        nfs->nfsi->client_generation++;
+        nfs->nfsi->has_lock_owner = 0;
+        {
+                struct nfsfh *fh;
+                for (fh = nfs->nfsi->open_files; fh; fh = fh->next) {
+                        fh->recovery_valid = 0;
+                }
+        }
+        nfs42_state_unlock(nfs->nfsi);
+        nfs->nfsi->session_sequence = exchanged->eir_sequenceid;
+        nfs->nfsi->reclaim_client = 1;
+        rpc->nfs4_recovery = NFS4_RECOVERY_CREATE;
+        nfs42_recover_session(rpc, nfs);
+}
+
+static void
+nfs42_reclaim_complete_cb(struct rpc_context *rpc, int status,
+                          void *command_data, void *private_data)
+{
+        struct nfs_context *nfs = private_data;
+        COMPOUND4res *res = command_data;
+
+        if (status == RPC_STATUS_CANCEL) {
+                return;
+        }
+        if (status != RPC_STATUS_SUCCESS || !res ||
+            (res->status != NFS4_OK && res->status != NFS4ERR_COMPLETE_ALREADY) ||
+            res->resarray.resarray_len != 2 ||
+            res->resarray.resarray_val[1].resop != OP_RECLAIM_COMPLETE) {
+                nfs4_recovery_failed(rpc);
+                RPC_LOG(rpc, 1, "NFSv4 client recovery: RECLAIM_COMPLETE failed");
+                return;
+        }
+        nfs->nfsi->reclaim_client = 0;
+        rpc->nfs4_recovery = NFS4_RECOVERY_IDLE;
+        RPC_LOG(rpc, 1, "NFSv4 client state recovery complete");
+}
+
+struct nfs42_reclaim {
+        struct nfs_context *nfs;
+        struct nfsfh *fh;
+};
+
+static void nfs42_reclaim_open(struct nfs42_reclaim *data);
+
+static void
+nfs42_reclaim_done(struct nfs42_reclaim *data, int cancelled)
+{
+        struct nfs_context *nfs = data->nfs;
+        nfs42_put_open(data->fh);
+        free(data);
+        if (!cancelled) {
+                nfs42_reclaim_next(nfs);
+        }
+}
+
+static void
+nfs42_reclaim_close_cb(struct rpc_context *rpc, int status,
+                       void *command_data, void *private_data)
+{
+        COMPOUND4res *res = command_data;
+        int failed = status != RPC_STATUS_SUCCESS || !res || res->status != NFS4_OK;
+
+        if (failed && status != RPC_STATUS_CANCEL) {
+                nfs4_recovery_failed(rpc);
+        }
+        nfs42_reclaim_done(private_data, failed);
+}
+
+static void
+nfs42_reclaim_open_cb(struct rpc_context *rpc, int status,
+                      void *command_data, void *private_data)
+{
+        struct nfs42_reclaim *data = private_data;
+        struct nfs_context *nfs = data->nfs;
+        struct nfsfh *fh = data->fh;
+        COMPOUND4res *res = command_data;
+        OPEN4resok *opened;
+        int closed;
+
+        if (status == RPC_STATUS_CANCEL) {
+                nfs42_reclaim_done(data, 1);
+                return;
+        }
+        if (status != RPC_STATUS_SUCCESS) {
+                /* Timeout callbacks can run under rpc_mutex. Defer any new
+                 * RPC to the service loop, never enqueue from this path. */
+                nfs42_state_lock(nfs->nfsi);
+                fh->recovery_error = NFS4ERR_IO;
+                nfs42_state_unlock(nfs->nfsi);
+                nfs4_recovery_failed(rpc);
+                nfs42_reclaim_done(data, 1);
+                return;
+        }
+        if (res && res->resarray.resarray_len == 1 &&
+            res->resarray.resarray_val[0].resop == OP_SEQUENCE &&
+            (res->status == NFS4ERR_BADSESSION || res->status == NFS4ERR_DEADSESSION)) {
+                /* OPEN did not run. Retry recovery without invalidating this
+                 * handle when the server loses a session during reclaim. */
+                nfs4_recovery_failed(rpc);
+                nfs42_reclaim_done(data, 1);
+                return;
+        }
+        if (status == RPC_STATUS_SUCCESS && res &&
+            res->status == NFS4ERR_NO_GRACE && !fh->recovery_no_grace) {
+                /* No locks or dirty data are being reclaimed on this path.
+                 * CLAIM_FH reopens the same object, never a replacement path. */
+                fh->recovery_no_grace = 1;
+                nfs42_reclaim_open(data);
+                return;
+        }
+        nfs42_state_lock(nfs->nfsi);
+        if (status != RPC_STATUS_SUCCESS || !res || res->status != NFS4_OK ||
+            res->resarray.resarray_len != 3 ||
+            res->resarray.resarray_val[2].resop != OP_OPEN ||
+            res->resarray.resarray_val[2].nfs_resop4_u.opopen.status != NFS4_OK) {
+                fh->recovery_error = status == RPC_STATUS_SUCCESS && res && res->status ?
+                        res->status : NFS4ERR_IO;
+                nfs42_state_unlock(nfs->nfsi);
+                nfs42_reclaim_done(data, 0);
+                return;
+        }
+        opened = &res->resarray.resarray_val[2].nfs_resop4_u.opopen.OPEN4res_u.resok4;
+        fh->wire_stateid.seqid = opened->stateid.seqid;
+        memcpy(fh->wire_stateid.other, opened->stateid.other, 12);
+        fh->recovery_valid = 1;
+        fh->recovery_generation = nfs->nfsi->client_generation;
+        closed = fh->recovery_closed;
+        nfs42_state_unlock(nfs->nfsi);
+        if (closed) {
+                COMPOUND4args args = {0};
+                nfs_argop4 op[3] = {0};
+                op[0].argop = OP_SEQUENCE;
+                nfs4_op_putfh(nfs, &op[1], fh);
+                nfs4_op_close(nfs, &op[2], fh);
+                op[2].nfs_argop4_u.opclose.open_stateid = opened->stateid;
+                args.argarray.argarray_len = 3;
+                args.argarray.argarray_val = op;
+                if (rpc_nfs4_recovery_task(rpc, nfs42_reclaim_close_cb, &args,
+                                            data, fh->open_auth)) {
+                        return;
+                }
+                nfs4_recovery_failed(rpc);
+                nfs42_reclaim_done(data, 1);
+                return;
+        }
+        nfs42_reclaim_done(data, 0);
+}
+
+static void
+nfs42_reclaim_open(struct nfs42_reclaim *data)
+{
+        struct nfs_context *nfs = data->nfs;
+        struct nfsfh *fh = data->fh;
+        COMPOUND4args args = {0};
+        nfs_argop4 op[3] = {0};
+        OPEN4args *opened = &op[2].nfs_argop4_u.opopen;
+
+        op[0].argop = OP_SEQUENCE;
+        nfs4_op_putfh(nfs, &op[1], fh);
+        op[2].argop = OP_OPEN;
+        opened->share_access = fh->share_access;
+        opened->share_deny = OPEN4_SHARE_DENY_NONE;
+        opened->owner.clientid = nfs->nfsi->clientid;
+        opened->owner.owner.owner_len = sizeof(fh->open_owner);
+        opened->owner.owner.owner_val = (char *)&fh->open_owner;
+        opened->openhow.opentype = OPEN4_NOCREATE;
+        opened->claim.claim = fh->recovery_no_grace ? CLAIM_FH : CLAIM_PREVIOUS;
+        opened->claim.open_claim4_u.delegate_type = OPEN_DELEGATE_NONE;
+        args.argarray.argarray_len = 3;
+        args.argarray.argarray_val = op;
+        if (!rpc_nfs4_recovery_task(nfs->rpc, nfs42_reclaim_open_cb, &args,
+                                    data, fh->open_auth)) {
+                nfs4_recovery_failed(nfs->rpc);
+                nfs42_reclaim_done(data, 1);
+        }
+}
+
+static void
+nfs42_reclaim_next(struct nfs_context *nfs)
+{
+        COMPOUND4args args = {0};
+        nfs_argop4 op[2] = {0};
+        struct nfsfh *fh;
+
+        nfs42_state_lock(nfs->nfsi);
+        for (fh = nfs->nfsi->open_files; fh; fh = fh->next) {
+                if (fh->recovery_closed || fh->recovery_error ||
+                    fh->recovery_generation == nfs->nfsi->client_generation) {
+                        continue;
+                }
+                /* We retain neither unstable WRITE payloads nor lock ranges.
+                 * Continuing such an open would silently promise lost state. */
+                if (fh->is_dirty || fh->recovery_locks) {
+                        fh->recovery_error = NFS4ERR_IO;
+                        continue;
+                }
+                fh->recovery_no_grace = 0;
+                fh->recovery_refs++;
+                break;
+        }
+        nfs42_state_unlock(nfs->nfsi);
+        if (fh) {
+                struct nfs42_reclaim *data = malloc(sizeof(*data));
+                if (!data) {
+                        nfs42_put_open(fh);
+                        nfs4_recovery_failed(nfs->rpc);
+                        return;
+                }
+                data->nfs = nfs;
+                data->fh = fh;
+                nfs42_reclaim_open(data);
+                return;
+        }
+
+        op[0].argop = OP_SEQUENCE;
+        nfs42_op_reclaim_complete(nfs, &op[1]);
+        args.argarray.argarray_len = 2;
+        args.argarray.argarray_val = op;
+        if (!rpc_nfs4_recovery_task(nfs->rpc, nfs42_reclaim_complete_cb,
+                                    &args, nfs, nfs->nfsi->session_auth)) {
+                nfs4_recovery_failed(nfs->rpc);
+        }
+}
+
+static void
+nfs42_recover_session_cb(struct rpc_context *rpc, int status,
+                         void *command_data, void *private_data)
+{
+        struct nfs_context *nfs = private_data;
+        COMPOUND4res *res = command_data;
+        CREATE_SESSION4resok *created;
+
+        if (status == RPC_STATUS_CANCEL) {
+                return;
+        }
+        if (status == RPC_STATUS_SUCCESS && res &&
+            res->status == NFS4ERR_STALE_CLIENTID &&
+            res->resarray.resarray_len == 1 &&
+            res->resarray.resarray_val[0].resop == OP_CREATE_SESSION &&
+            nfs->nfsi->recovery_exchanges == 0) {
+                COMPOUND4args args = {0};
+                nfs_argop4 op = {0};
+
+                nfs->nfsi->recovery_exchanges++;
+                rpc->nfs4_recovery = NFS4_RECOVERY_EXCHANGE;
+                args.argarray.argarray_len = nfs42_op_exchange_id(nfs, &op);
+                args.argarray.argarray_val = &op;
+                if (!rpc_nfs4_recovery_task(rpc, nfs42_recover_exchange_cb,
+                                            &args, nfs, nfs->nfsi->session_auth)) {
+                        nfs4_recovery_failed(rpc);
+                }
+                return;
+        }
+        if (status != RPC_STATUS_SUCCESS || !res || res->status != NFS4_OK ||
+            res->resarray.resarray_len != 1 ||
+            res->resarray.resarray_val[0].resop != OP_CREATE_SESSION ||
+            res->resarray.resarray_val[0].nfs_resop4_u.opcreatesession.csr_status != NFS4_OK) {
+                nfs4_recovery_failed(rpc);
+                RPC_LOG(rpc, 1, "NFSv4 session recovery failed: %s",
+                        status == RPC_STATUS_SUCCESS && res ?
+                        nfsstat4_to_str(res->status) : "RPC failure");
+                return;
+        }
+        created = &res->resarray.resarray_val[0].nfs_resop4_u.opcreatesession.CREATE_SESSION4res_u.csr_resok4;
+        if (created->csr_sequence != nfs->nfsi->session_sequence) {
+                nfs4_recovery_failed(rpc);
+                RPC_LOG(rpc, 1, "NFSv4 session recovery: wrong CREATE_SESSION sequence");
+                return;
+        }
+        if (nfs4_session_init(rpc, created->csr_sessionid,
+                             created->csr_fore_chan_attrs.ca_maxrequests)) {
+                nfs4_recovery_failed(rpc);
+                RPC_LOG(rpc, 1, "NFSv4 session recovery: cannot allocate slots");
+                return;
+        }
+        nfs->nfsi->session_sequence = created->csr_sequence + 1;
+        if (nfs->nfsi->reclaim_client) {
+                rpc->nfs4_recovery = NFS4_RECOVERY_RECLAIM;
+                nfs42_reclaim_next(nfs);
+                return;
+        }
+        rpc->nfs4_recovery = NFS4_RECOVERY_IDLE;
+        RPC_LOG(rpc, 1, "NFSv4 session recovered with existing client state");
+}
+
+static void
+nfs42_recover_session(struct rpc_context *rpc, void *private_data)
+{
+        struct nfs_context *nfs = private_data;
+        COMPOUND4args args = {0};
+        nfs_argop4 op = {0};
+
+        args.argarray.argarray_len = nfs42_op_create_session(nfs, &op,
+                nfs->nfsi->clientid, nfs->nfsi->session_sequence);
+        args.argarray.argarray_val = &op;
+        if (!rpc_nfs4_recovery_task(rpc, nfs42_recover_session_cb, &args, nfs,
+                                    nfs->nfsi->session_auth)) {
+                nfs4_recovery_failed(rpc);
+                RPC_LOG(rpc, 1, "Failed to queue NFSv4 session recovery");
+        }
+}
+
+static void
+nfs42_recover_start(struct rpc_context *rpc, void *private_data)
+{
+        struct nfs_context *nfs = private_data;
+        nfs->nfsi->recovery_exchanges = 0;
+        nfs42_recover_session(rpc, nfs);
+}
+
+/* Keep the mount identity even when a multi-user caller replaces rpc->auth. */
+static int
+nfs42_save_session_auth(struct nfs_context *nfs)
+{
+        const struct AUTH *auth = nfs->rpc->auth;
+
+        free(nfs->nfsi->session_auth);
+        nfs->nfsi->session_auth = NULL;
+        nfs->rpc->nfs4_recover = NULL;
+        nfs->rpc->nfs4_recovery = NFS4_RECOVERY_IDLE;
+        /* GSS recovery also needs security-context lifetime handling. */
+        if (auth->ah_cred.oa_flavor != AUTH_SYS || nfs->rpc->is_udp) {
+                return 0;
+        }
+#ifdef HAVE_LIBKRB5
+        if (nfs->rpc->sec != RPC_SEC_UNDEFINED) {
+                return 0;
+        }
+#endif
+        nfs->nfsi->session_auth = nfs42_copy_auth(auth);
+        return nfs->nfsi->session_auth ? 0 : -1;
+}
+
 static int
 nfs42_op_allocate(struct nfs_context *nfs _U_, nfs_argop4 *op,
                   struct nfsfh *fh, uint64_t offset, uint64_t length)
@@ -1403,6 +2166,11 @@ nfs42_op_write_same(struct nfs_context *nfs _U_, nfs_argop4 *op,
         memcpy(wsargs->wsa_stateid.other, fh->stateid.other, 12);
         wsargs->wsa_stable = stable ? FILE_SYNC4 : UNSTABLE4;
         wsargs->wsa_adb = *adb;
+        if (!stable && fh->nfsi) {
+                nfs42_state_lock(fh->nfsi);
+                fh->write_generation++;
+                nfs42_state_unlock(fh->nfsi);
+        }
 
         return 1;
 }
@@ -1458,11 +2226,8 @@ static int
 nfs4_start_compound(struct nfs_context *nfs, nfs_argop4 *op)
 {
 #ifdef HAVE_NFS4_2
-        /*
-         * Only once the session exists. The COMPOUNDs that build it run
-         * before there is anything to sequence against.
-         */
-        if (nfs->nfsi->version == NFS_V4_2 && nfs->rpc->nfs4_session_valid) {
+        /* Bootstrap operations have their own unsequenced builders. */
+        if (nfs->nfsi->version == NFS_V4_2) {
                 return nfs42_op_sequence(nfs, op);
         }
 #endif /* HAVE_NFS4_2 */
@@ -1959,6 +2724,15 @@ nfs4_mount_5_cb(struct rpc_context *rpc, int status, void *command_data,
 			   nfs->nfsi->auto_reconnect,
 			   nfs->nfsi->timeout,
 			   nfs->nfsi->retrans);
+#ifdef HAVE_NFS4_2
+        if (nfs->nfsi->version == NFS_V4_2 && nfs->nfsi->session_auth) {
+                rpc->nfs4_recover = nfs42_recover_start;
+                rpc->nfs4_bind_state = nfs42_bind_state;
+                rpc->nfs4_prepare_state = nfs42_prepare_state;
+                rpc->nfs4_release_state = nfs42_release_state;
+                rpc->nfs4_recover_data = nfs;
+        }
+#endif
         
         data->cb(0, nfs, NULL, data->private_data);
         free_nfs4_cb_data(data);
@@ -2201,6 +2975,7 @@ nfs42_mount_2_cb(struct rpc_context *rpc, int status, void *command_data,
                 return;
         }
         csresok = &res->resarray.resarray_val[i].nfs_resop4_u.opcreatesession.CREATE_SESSION4res_u.csr_resok4;
+        nfs->nfsi->session_sequence = csresok->csr_sequence + 1;
 
         /*
          * A server may hand back a smaller fore channel than we asked for, so
@@ -2312,6 +3087,13 @@ nfs42_mount_start(struct rpc_context *rpc, int status, void *command_data _U_,
          */
         nfs4_session_destroy(rpc);
 
+        if (nfs42_save_session_auth(nfs)) {
+                nfs_set_error(nfs, "Out of memory saving NFSv4 session credentials");
+                data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+                free_nfs4_cb_data(data);
+                return;
+        }
+
         memset(op, 0, sizeof(op));
         /* EXCHANGE_ID is what creates the state, so it carries no SEQUENCE. */
         i = nfs42_op_exchange_id(nfs, &op[0]);
@@ -2365,6 +3147,9 @@ int
 nfs42_umount_async(struct nfs_context *nfs, nfs_cb cb, void *private_data)
 {
         struct nfs4_cb_data *data;
+
+        nfs->rpc->nfs4_recover = NULL;
+        nfs->rpc->nfs4_recovery = NFS4_RECOVERY_IDLE;
 
         if (!rpc_nfs4_session_is_valid(nfs->rpc)) {
                 cb(0, nfs, NULL, private_data);
@@ -2965,7 +3750,14 @@ nfs4_open_cb(struct rpc_context *rpc, int status, void *command_data,
         oresok = &res->resarray.resarray_val[i].nfs_resop4_u.opopen.OPEN4res_u.resok4;
         fh->stateid.seqid = oresok->stateid.seqid;
         memcpy(fh->stateid.other, oresok->stateid.other, 12);
-
+#ifdef HAVE_NFS4_2
+        if (nfs42_register_open(nfs, fh, data->filler.flags) < 0) {
+                nfs_set_error(nfs, "Failed to retain NFSv4 OPEN recovery state");
+                data->cb(-ENOMEM, nfs, nfs_get_error(nfs), data->private_data);
+                free_nfs4_cb_data(data);
+                return;
+        }
+#endif
 
         if (oresok->rflags & OPEN4_RESULT_CONFIRM) {
                 COMPOUND4args args;
@@ -3500,6 +4292,16 @@ nfs4_close_cb(struct rpc_context *rpc, int status, void *command_data,
                 return;
         }
 
+#ifdef HAVE_NFS4_2
+        (void)nfs42_check_commit(nfs, nfsfh, res);
+        if (nfsfh->nfsi && nfsfh->recovery_error) {
+                data->cb(nfsstat4_to_errno(nfsfh->recovery_error), nfs,
+                         "NFSv4 open state or unstable data was lost", data->private_data);
+                free_nfs4_cb_data(data);
+                return;
+        }
+#endif
+
         data->cb(0, nfs, NULL, data->private_data);
         free_nfs4_cb_data(data);
 }
@@ -3851,6 +4653,14 @@ nfs4_pwrite_cb(struct rpc_context *rpc, int status, void *command_data,
                 return;
         }
         wres = &res->resarray.resarray_val[i].nfs_resop4_u.opwrite.WRITE4res_u.resok4;
+
+#ifdef HAVE_NFS4_2
+        if (nfs42_note_write(nfs, nfsfh, wres->writeverf, wres->committed)) {
+                data->cb(-EIO, nfs, nfs_get_error(nfs), data->private_data);
+                free_nfs4_cb_data(data);
+                return;
+        }
+#endif
 
         if (data->rw_data.update_pos) {
                 nfsfh->offset = data->rw_data.offset + wres->count;
@@ -5015,6 +5825,39 @@ nfs4_fsync_cb(struct rpc_context *rpc, int status, void *command_data,
                 return;
         }
 
+#ifdef HAVE_NFS4_2
+        if (data->filler.blob0.val) {
+                struct nfsfh *fh = data->filler.blob0.val;
+                int i, lost;
+                if ((i = nfs4_find_op(nfs, data, res, OP_COMMIT, "COMMIT")) < 0) {
+                        return;
+                }
+                lost = nfs42_check_commit(nfs, fh, res);
+                nfs42_state_lock(fh->nfsi);
+                /* COMMIT has no stateid. Its result belongs to this open,
+                 * not every other descriptor for the same filehandle. */
+                if (fh->recovery_error) {
+                        int error = nfsstat4_to_errno(fh->recovery_error);
+                        nfs42_state_unlock(fh->nfsi);
+                        data->cb(error, nfs, "NFSv4 open state or unstable data was lost",
+                                 data->private_data);
+                        free_nfs4_cb_data(data);
+                        return;
+                }
+                if (!lost && !fh->pending_writes &&
+                    fh->write_generation == data->rw_data.offset) {
+                        fh->is_dirty = 0;
+                        fh->write_verifier_valid = 0;
+                }
+                nfs42_state_unlock(fh->nfsi);
+                if (lost) {
+                        data->cb(-EIO, nfs, nfs_get_error(nfs), data->private_data);
+                        free_nfs4_cb_data(data);
+                        return;
+                }
+        }
+#endif
+
         data->cb(0, nfs, NULL, data->private_data);
         free_nfs4_cb_data(data);
 }
@@ -5038,6 +5881,17 @@ nfs4_fsync_async(struct nfs_context *nfs, struct nfsfh *fh, nfs_cb cb,
         data->cb           = cb;
         data->private_data = private_data;
 
+#ifdef HAVE_NFS4_2
+        if (fh->nfsi) {
+                nfs42_state_lock(fh->nfsi);
+                fh->recovery_refs++;
+                data->rw_data.offset = fh->write_generation;
+                nfs42_state_unlock(fh->nfsi);
+                data->filler.blob0.val = fh;
+                data->filler.blob0.free = (blob_free)nfs42_put_open;
+        }
+#endif
+
         memset(op, 0, sizeof(op));
 
         i = nfs4_start_compound(nfs, op);
@@ -5050,7 +5904,6 @@ nfs4_fsync_async(struct nfs_context *nfs, struct nfsfh *fh, nfs_cb cb,
 
         if (rpc_nfs4_compound_task(nfs->rpc, nfs4_fsync_cb, &args,
                                    data) == NULL) {
-                data->filler.blob0.val = NULL;
                 free_nfs4_cb_data(data);
                 return -1;
         }
@@ -5367,6 +6220,13 @@ nfs42_write_same_cb(struct rpc_context *rpc, int status, void *command_data,
         }
         wsresok = &res->resarray.resarray_val[i].nfs_resop4_u.opwritesame.WRITE_SAME4res_u.wsr_resok4;
 
+        if (nfs42_note_write(nfs, data->filler.blob0.val,
+                              wsresok->wr_writeverf, wsresok->wr_committed)) {
+                data->cb(-EIO, nfs, nfs_get_error(nfs), data->private_data);
+                free_nfs4_cb_data(data);
+                return;
+        }
+
         data->cb(0, nfs, wsresok, data->private_data);
         free_nfs4_cb_data(data);
 }
@@ -5403,6 +6263,7 @@ nfs42_write_same_async(struct nfs_context *nfs, struct nfsfh *fh,
         i = nfs4_start_compound(nfs, op);
         i += nfs4_op_putfh(nfs, &op[i], fh);
         i += nfs42_op_write_same(nfs, &op[i], fh, adb, stable);
+        data->filler.blob0.val = fh;
 
         memset(&args, 0, sizeof(args));
         args.argarray.argarray_len = i;
@@ -5634,6 +6495,13 @@ nfs4_lockf_cb(struct rpc_context *rpc, int status, void *command_data,
 
                 lresok = &res->resarray.resarray_val[i].nfs_resop4_u.oplock.LOCK4res_u.resok4;
                 nfs->nfsi->has_lock_owner = 1;
+#ifdef HAVE_NFS4_2
+                if (fh->nfsi) {
+                        nfs42_state_lock(fh->nfsi);
+                        fh->recovery_locks = 1;
+                        nfs42_state_unlock(fh->nfsi);
+                }
+#endif
                 fh->lock_stateid.seqid = lresok->lock_stateid.seqid;
                 memcpy(fh->lock_stateid.other, lresok->lock_stateid.other, 12);
                 break;
@@ -5753,6 +6621,13 @@ nfs4_fcntl_cb(struct rpc_context *rpc, int status, void *command_data,
 
                         lresok = &res->resarray.resarray_val[i].nfs_resop4_u.oplock.LOCK4res_u.resok4;
                         nfs->nfsi->has_lock_owner = 1;
+#ifdef HAVE_NFS4_2
+                        if (fh->nfsi) {
+                                nfs42_state_lock(fh->nfsi);
+                                fh->recovery_locks = 1;
+                                nfs42_state_unlock(fh->nfsi);
+                        }
+#endif
                         fh->lock_stateid.seqid = lresok->lock_stateid.seqid;
                         memcpy(fh->lock_stateid.other,
                                lresok->lock_stateid.other, 12);
