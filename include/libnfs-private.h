@@ -1068,6 +1068,7 @@ struct nfs_context_internal {
        sequenceid4 session_sequence;
        struct AUTH *session_auth;
        int reclaim_client;
+       int reclaim_complete;
        unsigned int recovery_exchanges;
        uint64_t client_generation;
        struct nfsfh *open_files;

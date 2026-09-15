@@ -29,6 +29,10 @@ int main(void) { return 77; }
 } } while (0)
 #define MAX_OPS 16
 
+enum reclaim_fault {
+        LOSS_NONE, LOSS_RECLAIM, LOSS_REOPEN, LOSS_COMPLETE
+};
+
 struct completion {
 #ifdef HAVE_STDATOMIC_H
         atomic_uint calls;
@@ -52,6 +56,8 @@ struct scenario {
         int active_write, open_uid, reclaim_delays, post_grace, verifier_change;
         int threaded;
         int new_after_loss, reclaim_destroy, reclaim_close, reclaim_loss, reclaim_reboot;
+        int reopen_delays;
+        nfsstat4 reclaim_error;
 };
 
 struct fixture {
@@ -90,6 +96,8 @@ struct fixture {
         int reclaim_delays, post_grace, verifier_change;
         int threaded;
         int reuse_stateid, reclaim_loss, reclaim_reboot;
+        int reopen_delays;
+        nfsstat4 reclaim_error;
         unsigned reclaim_faults;
         int standalone;
         char *contents;
@@ -378,9 +386,13 @@ serve(struct fixture *f)
                       "CREATE_SESSION retry changed the original request");
                 f->create_request_length = 0;
         }
-        if (f->reclaim_loss && args.argarray.argarray_len == 3 &&
-            args.argarray.argarray_val[2].argop == OP_OPEN &&
-            args.argarray.argarray_val[2].nfs_argop4_u.opopen.claim.claim == CLAIM_PREVIOUS) {
+        if ((f->reclaim_loss == LOSS_COMPLETE && args.argarray.argarray_len == 2 &&
+             args.argarray.argarray_val[1].argop == OP_RECLAIM_COMPLETE) ||
+            ((f->reclaim_loss == LOSS_RECLAIM || f->reclaim_loss == LOSS_REOPEN) &&
+             args.argarray.argarray_len == 3 &&
+             args.argarray.argarray_val[2].argop == OP_OPEN &&
+             args.argarray.argarray_val[2].nfs_argop4_u.opopen.claim.claim ==
+                     (f->reclaim_loss == LOSS_REOPEN ? CLAIM_FH : CLAIM_PREVIOUS))) {
                 f->reclaim_loss = f->valid = 0;
                 f->reclaim_faults++;
                 if (f->reclaim_reboot) {
@@ -446,11 +458,10 @@ serve(struct fixture *f)
                                 status = NFS4ERR_GRACE;
                                 break;
                         }
-                        if (!f->reclaim_complete && (open->claim.claim == CLAIM_PREVIOUS || open->claim.claim == CLAIM_FH)) {
-                                CHECK(file == 1 && !f->reclaim_complete &&
-                                      (open->claim.claim == CLAIM_PREVIOUS ||
-                                       (f->no_grace && open->claim.claim == CLAIM_FH)),
-                                      "recovery OPEN did not use the original filehandle before RECLAIM_COMPLETE");
+                        CHECK(open->claim.claim == CLAIM_PREVIOUS ? !f->reclaim_complete : f->reclaim_complete,
+                              "CLAIM_PREVIOUS must precede RECLAIM_COMPLETE; non-reclaim OPEN must follow it");
+                        if (open->claim.claim == CLAIM_PREVIOUS || (f->opens && open->claim.claim == CLAIM_FH)) {
+                                CHECK(file == 1, "recovery OPEN changed the original filehandle");
                                 CHECK(call.body.cbody.cred.oa_length == f->open_cred_length &&
                                       !memcmp(call.body.cbody.cred.oa_base, f->open_cred, f->open_cred_length),
                                       "recovery OPEN used another caller's credentials");
@@ -466,6 +477,15 @@ serve(struct fixture *f)
                                 }
                                 if (f->no_grace && open->claim.claim == CLAIM_PREVIOUS) {
                                         status = NFS4ERR_NO_GRACE;
+                                        break;
+                                }
+                                if (f->reclaim_error && open->claim.claim == CLAIM_PREVIOUS) {
+                                        status = f->reclaim_error;
+                                        break;
+                                }
+                                if (f->reopen_delays && open->claim.claim == CLAIM_FH) {
+                                        f->reopen_delays--;
+                                        status = NFS4ERR_GRACE;
                                         break;
                                 }
                                 if (f->reclaim_stale) {
@@ -806,10 +826,11 @@ serve_mount(void)
                         char command[32];
                         if (!fgets(command, sizeof(command), stdin) || !strcmp(command, "STOP\n")) {
                                 stop = 1;
-                        } else if (!strcmp(command, "REBOOT\n")) {
+                        } else if (!strcmp(command, "REBOOT\n") || !strcmp(command, "REBOOT_NOGRACE\n")) {
                                 ++f.clientid;
                                 f.create_sequence = 1;
                                 f.valid = f.file_open = f.locked = f.reclaim_complete = 0;
+                                f.no_grace = !strcmp(command, "REBOOT_NOGRACE\n");
                                 printf("RESET %llu\n", (unsigned long long)f.clientid);
                         } else {
                                 CHECK(!strcmp(command, "STATS\n"), "mount peer control command");
@@ -872,6 +893,16 @@ int main(int argc, char **argv)
                 {.name = "reboot-active-read", .session_lost = 1, .reboot = 1, .open_file = 1, .active = 1},
                 {.name = "reboot-open-credentials", .session_lost = 1, .reboot = 1, .open_file = 1, .switch_uid = 1},
                 {.name = "reboot-open-no-grace", .session_lost = 1, .reboot = 1, .open_file = 1, .no_grace = 1},
+                {.name = "reboot-no-grace-delay", .session_lost = 1, .reboot = 1, .open_file = 1, .no_grace = 1, .reopen_delays = 10},
+                {.name = "reboot-no-grace-stale", .session_lost = 1, .reboot = 1, .open_file = 1, .no_grace = 1, .reclaim_stale = 1},
+                {.name = "reboot-no-grace-session-loss", .session_lost = 1, .reboot = 1, .open_file = 1, .no_grace = 1, .reclaim_loss = LOSS_REOPEN},
+                {.name = "reboot-no-grace-reboot", .session_lost = 1, .reboot = 1, .open_file = 1, .no_grace = 1, .reclaim_loss = LOSS_REOPEN, .reclaim_reboot = 1},
+                {.name = "reboot-no-grace-complete-loss", .session_lost = 1, .reboot = 1, .open_file = 1, .no_grace = 1, .reclaim_loss = LOSS_COMPLETE},
+                {.name = "reboot-no-grace-close", .session_lost = 1, .reboot = 1, .open_file = 1, .active = 1, .no_grace = 1, .reopen_delays = 1, .reclaim_close = 1},
+                {.name = "reboot-no-grace-destroy", .session_lost = 1, .reboot = 1, .open_file = 1, .active = 1, .no_grace = 1, .reopen_delays = 1, .reclaim_destroy = 1},
+                {.name = "reboot-no-grace-threaded", .session_lost = 1, .reboot = 1, .open_file = 1, .active = 1, .no_grace = 1, .threaded = 1},
+                {.name = "reboot-reclaim-bad", .session_lost = 1, .reboot = 1, .open_file = 1, .reclaim_error = NFS4ERR_RECLAIM_BAD},
+                {.name = "reboot-reclaim-conflict", .session_lost = 1, .reboot = 1, .open_file = 1, .reclaim_error = NFS4ERR_RECLAIM_CONFLICT},
                 {.name = "reboot-open-stale", .session_lost = 1, .reboot = 1, .open_file = 1, .reclaim_stale = 1},
                 {.name = "reboot-dirty-open", .session_lost = 1, .reboot = 1, .open_file = 1, .dirty = 1},
                 {.name = "reboot-fsynced-open", .session_lost = 1, .reboot = 1, .open_file = 1, .dirty = 1, .fsync_before_reboot = 1},
@@ -888,8 +919,8 @@ int main(int argc, char **argv)
                 {.name = "reboot-new-open-after-loss", .session_lost = 1, .reboot = 1, .open_file = 1, .dirty = 1, .new_after_loss = 1},
                 {.name = "reboot-reclaim-destroy", .session_lost = 1, .reboot = 1, .open_file = 1, .active = 1, .reclaim_delays = 1, .reclaim_destroy = 1},
                 {.name = "reboot-reclaim-close", .session_lost = 1, .reboot = 1, .open_file = 1, .active = 1, .reclaim_delays = 1, .reclaim_close = 1},
-                {.name = "reboot-reclaim-session-loss", .session_lost = 1, .reboot = 1, .open_file = 1, .reclaim_loss = 1},
-                {.name = "reboot-reclaim-reboot", .session_lost = 1, .reboot = 1, .open_file = 1, .reclaim_loss = 1, .reclaim_reboot = 1},
+                {.name = "reboot-reclaim-session-loss", .session_lost = 1, .reboot = 1, .open_file = 1, .reclaim_loss = LOSS_RECLAIM},
+                {.name = "reboot-reclaim-reboot", .session_lost = 1, .reboot = 1, .open_file = 1, .reclaim_loss = LOSS_RECLAIM, .reclaim_reboot = 1},
                 {.name = "reboot-held-repeat", .session_lost = 1, .reboot = 1, .open_file = 1, .repeat = 1}
         };
         const struct scenario *scenario;
@@ -1005,6 +1036,8 @@ int main(int argc, char **argv)
                 f.create_sequence = 1;
                 f.file_open = f.locked = f.reclaim_complete = 0;
                 f.no_grace = scenario->no_grace;
+                f.reclaim_error = scenario->reclaim_error;
+                f.reopen_delays = scenario->reopen_delays;
                 f.reclaim_stale = scenario->reclaim_stale;
                 f.reclaim_delays = scenario->reclaim_delays;
                 f.post_grace = scenario->post_grace;
@@ -1216,8 +1249,8 @@ after_open:
                 CHECK(!f.create_delays && !f.create_request_length &&
                       (!scenario->drop_when_delayed || !f.drop_when_delayed),
                       "CREATE_SESSION DELAY was not exercised and completed");
-        CHECK(!f.reclaim_delays && !f.post_grace, "recovery/grace backoff did not complete");
-        CHECK(f.reclaim_faults == (unsigned)scenario->reclaim_loss, "session loss during reclaim was not exercised");
+        CHECK(!f.reclaim_delays && !f.post_grace && !f.reopen_delays, "recovery/grace backoff did not complete");
+        CHECK(f.reclaim_faults == (unsigned)!!scenario->reclaim_loss, "session loss during reclaim was not exercised");
         nfs_destroy_context(f.nfs);
         close(f.peer);
         close(f.listener);

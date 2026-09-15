@@ -66,6 +66,9 @@ foreach(SCENARIO renew-ok renew-delay renew-lost reboot-renew rebind-ok reboot-r
                  recovery-cancel recovery-destroy recovery-create-delay recovery-create-delay-reconnect
                  lost-mutation-reply reboot-open reboot-active-read reboot-open-credentials
                  reboot-open-no-grace reboot-open-stale reboot-dirty-open reboot-fsynced-open
+                 reboot-no-grace-delay reboot-no-grace-stale reboot-no-grace-session-loss
+                 reboot-no-grace-reboot reboot-no-grace-complete-loss reboot-no-grace-close
+                 reboot-no-grace-destroy reboot-no-grace-threaded reboot-reclaim-bad reboot-reclaim-conflict
                  reboot-lock-lost reboot-new-open reboot-rejected-mutation reboot-active-write
                  reboot-open-other-uid reboot-reclaim-delay reboot-create-long-delay reboot-post-grace
                  commit-verifier-change reboot-threaded-read reboot-new-open-after-loss

@@ -1774,11 +1774,13 @@ nfs42_recover_exchange_cb(struct rpc_context *rpc, int status,
                 struct nfsfh *fh;
                 for (fh = nfs->nfsi->open_files; fh; fh = fh->next) {
                         fh->recovery_valid = 0;
+                        fh->recovery_no_grace = 0;
                 }
         }
         nfs42_state_unlock(nfs->nfsi);
         nfs->nfsi->session_sequence = exchanged->eir_sequenceid;
         nfs->nfsi->reclaim_client = 1;
+        nfs->nfsi->reclaim_complete = 0;
         rpc->nfs4_recovery = NFS4_RECOVERY_CREATE;
         nfs42_recover_session(rpc, nfs);
 }
@@ -1801,9 +1803,8 @@ nfs42_reclaim_complete_cb(struct rpc_context *rpc, int status,
                 RPC_LOG(rpc, 1, "NFSv4 client recovery: RECLAIM_COMPLETE failed");
                 return;
         }
-        nfs->nfsi->reclaim_client = 0;
-        rpc->nfs4_recovery = NFS4_RECOVERY_IDLE;
-        RPC_LOG(rpc, 1, "NFSv4 client state recovery complete");
+        nfs->nfsi->reclaim_complete = 1;
+        nfs42_reclaim_next(nfs);
 }
 
 struct nfs42_reclaim {
@@ -1871,12 +1872,17 @@ nfs42_reclaim_open_cb(struct rpc_context *rpc, int status,
                 nfs42_reclaim_done(data, 1);
                 return;
         }
-        if (status == RPC_STATUS_SUCCESS && res &&
-            res->status == NFS4ERR_NO_GRACE && !fh->recovery_no_grace) {
-                /* No locks or dirty data are being reclaimed on this path.
-                 * CLAIM_FH reopens the same object, never a replacement path. */
+        if (res && res->resarray.resarray_len == 3 &&
+            res->resarray.resarray_val[2].resop == OP_OPEN &&
+            (res->status == NFS4ERR_NO_GRACE ||
+             res->status == NFS4ERR_RECLAIM_BAD ||
+             res->status == NFS4ERR_RECLAIM_CONFLICT) && !fh->recovery_no_grace) {
+                /* RFC 8881 18.51.3: finish reclaim before a non-reclaim OPEN.
+                 * Only clean, unlocked opens reach this fallback. */
+                nfs42_state_lock(nfs->nfsi);
                 fh->recovery_no_grace = 1;
-                nfs42_reclaim_open(data);
+                nfs42_state_unlock(nfs->nfsi);
+                nfs42_reclaim_done(data, 0);
                 return;
         }
         nfs42_state_lock(nfs->nfsi);
@@ -1956,7 +1962,8 @@ nfs42_reclaim_next(struct nfs_context *nfs)
         nfs42_state_lock(nfs->nfsi);
         for (fh = nfs->nfsi->open_files; fh; fh = fh->next) {
                 if (fh->recovery_closed || fh->recovery_error ||
-                    fh->recovery_generation == nfs->nfsi->client_generation) {
+                    fh->recovery_generation == nfs->nfsi->client_generation ||
+                    (fh->recovery_no_grace && !nfs->nfsi->reclaim_complete)) {
                         continue;
                 }
                 /* We retain neither unstable WRITE payloads nor lock ranges.
@@ -1965,7 +1972,6 @@ nfs42_reclaim_next(struct nfs_context *nfs)
                         fh->recovery_error = NFS4ERR_IO;
                         continue;
                 }
-                fh->recovery_no_grace = 0;
                 fh->recovery_refs++;
                 break;
         }
@@ -1980,6 +1986,13 @@ nfs42_reclaim_next(struct nfs_context *nfs)
                 data->nfs = nfs;
                 data->fh = fh;
                 nfs42_reclaim_open(data);
+                return;
+        }
+
+        if (nfs->nfsi->reclaim_complete) {
+                nfs->nfsi->reclaim_client = 0;
+                nfs->rpc->nfs4_recovery = NFS4_RECOVERY_IDLE;
+                RPC_LOG(nfs->rpc, 1, "NFSv4 client state recovery complete");
                 return;
         }
 
